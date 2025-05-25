@@ -35,16 +35,16 @@ func _physics_process(delta: float) -> void:
 	var direction = Vector3.ZERO
 
 	if Input.is_action_pressed("move_forward"):
-		print("[CameraController.gd] (_process) - moveww_forward pressed")
+		# print("[CameraController.gd] (_process) - moveww_forward pressed")
 		direction -= transform.basis.z
 	if Input.is_action_pressed("move_backward"):
-		print("[CameraController.gd] (_process) - move_backward pressed")
+		# print("[CameraController.gd] (_process) - move_backward pressed")
 		direction += transform.basis.z
 	if Input.is_action_pressed("move_left"):
-		print("[CameraController.gd] (_process) - move_left pressed")
+		# print("[CameraController.gd] (_process) - move_left pressed")
 		direction -= transform.basis.x
 	if Input.is_action_pressed("move_right"):
-		print("[CameraController.gd] (_process) - move_rightd pressed")
+		# print("[CameraController.gd] (_process) - move_rightd pressed")
 		direction += transform.basis.x
 
 	direction.y = 0 # Prevent moving up/down

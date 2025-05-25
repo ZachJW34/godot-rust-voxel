@@ -1,7 +1,9 @@
 use cgmath::Point3;
+use godot::classes::base_material_3d::TextureParam;
 use godot::classes::mesh::PrimitiveType;
 use godot::classes::{
-    ArrayMesh, BoxMesh, ISprite2D, Mesh, MeshInstance3D, Sprite2D, StandardMaterial3D,
+    ArrayMesh, BoxMesh, ISprite2D, Mesh, MeshInstance3D, ResourceLoader, Sprite2D,
+    StandardMaterial3D, Texture2D,
 };
 use godot::prelude::*;
 use voxel::{Block, CHUNK_SIZE, ToMaterial, VoxelWorld};
@@ -95,58 +97,124 @@ impl ToMaterial for Block {
     }
 }
 
+const ARRAY_VERTEX: usize = 0;
+const ARRAY_NORMAL: usize = 1;
+const ARRAY_TANGENT: usize = 2;
+const ARRAY_COLOR: usize = 3;
+const ARRAY_TEX_UV: usize = 4;
+const ARRAY_TEX_UV2: usize = 5;
+const ARRAY_CUSTOM0: usize = 6;
+const ARRAY_CUSTOM1: usize = 7;
+const ARRAY_CUSTOM2: usize = 8;
+const ARRAY_CUSTOM3: usize = 9;
+const ARRAY_BONES: usize = 10;
+const ARRAY_WEIGHTS: usize = 11;
+const ARRAY_INDEX: usize = 12;
+const ARRAY_MAX: usize = 13;
+
 #[godot_api]
 impl INode3D for CubeSpawner {
     fn init(base: Base<Node3D>) -> Self {
-        println!("[CubeSpawner] (init)");
+        println!("[CubeSpawner] (init)!");
         Self {
             base,
-            voxels: VoxelWorld::init(),
+            voxels: VoxelWorld::init(1, 1, 1),
         }
     }
 
     fn ready(&mut self) {
-        let terrain = terrain::generate_terrain(CHUNK_SIZE, CHUNK_SIZE, 0.05, CHUNK_SIZE as f64, 1);
-        for point in terrain {
-            self.voxels.add_block(&point, Block::Grass);
+        // let terrain = terrain::generate_terrain(
+        //     self.voxels.x_chunks * CHUNK_SIZE,
+        //     self.voxels.z_chunks * CHUNK_SIZE,
+        //     0.05,
+        //     CHUNK_SIZE as f64,
+        //     1,
+        // );
+        // for point in terrain {
+        //     // godot_print!("[CubeSpawner] (ready) - adding block at {point:?}");
+        //     self.voxels.add_block(&point, Block::Grass);
+        //     for y in 0..point.y {
+        //         self.voxels
+        //             .add_block(&Point3::new(point.x, y, point.z), Block::Stone);
+        //     }
+        // }
+        self.voxels.add_block(&p(0, 0, 0), Block::Grass);
+        self.voxels.add_block(&p(1, 0, 0), Block::Grass);
+        self.voxels.add_block(&p(2, 0, 0), Block::Grass);
+        self.voxels.add_block(&p(0, 1, 0), Block::Grass);
+        self.voxels.add_block(&p(0, 2, 0), Block::Grass);
+        self.voxels.add_block(&p(0, 0, 1), Block::Stone);
+        self.voxels.add_block(&p(0, 0, 2), Block::Stone);
+
+        let atlas_texture = ResourceLoader::singleton()
+            .load("res://textures/atlas_color.png")
+            .unwrap()
+            .cast::<Texture2D>();
+
+        let chunks = self.voxels.mesh_chunks();
+
+        for (vertices, indices) in chunks {
+            // godot_print!("[VoxelWorld] (ready) - vertices: {:?}", vertices);
+            let mut array = VariantArray::new();
+            array.resize(ARRAY_MAX, &Variant::nil());
+
+            let positions = PackedVector3Array::from_iter(
+                vertices.iter().map(|v| Vector3::from_array(v.position)),
+            );
+            let normals = PackedVector3Array::from_iter(
+                vertices.iter().map(|v| Vector3::from_array(v.normal)),
+            );
+            let uvs = PackedVector2Array::from_iter(
+                vertices.iter().map(|v| Vector2::from_array(v.tex_coords)),
+            );
+            let indices = PackedInt32Array::from_iter(indices.iter().map(|i| *i as i32));
+
+            array.set(ARRAY_VERTEX, &positions.to_variant());
+            array.set(ARRAY_NORMAL, &normals.to_variant());
+            array.set(ARRAY_TEX_UV, &uvs.to_variant());
+            array.set(ARRAY_INDEX, &indices.to_variant());
+
+            let mut mesh = ArrayMesh::new_gd();
+            mesh.add_surface_from_arrays(PrimitiveType::TRIANGLES, &array);
+            let mut material = StandardMaterial3D::new_gd();
+            material.set_texture(TextureParam::ALBEDO, &atlas_texture);
+            mesh.surface_set_material(0, &material);
+            let mut mesh_instance = MeshInstance3D::new_alloc();
+            mesh_instance.set_mesh(&mesh);
+            self.base_mut().add_child(&mesh_instance);
         }
-        // self.voxels.add_block(&p(0, 0, 0), Block::Grass);
-        // self.voxels.add_block(&p(2, 0, 0), Block::Grass);
-        // self.voxels.add_block(&p(0, 2, 0), Block::Grass);
-        // self.voxels.add_block(&p(0, 0, 2), Block::Stone);
 
-        let mut cubes: Vec<Gd<MeshInstance3D>> = vec![];
+        // let mut cubes: Vec<Gd<MeshInstance3D>> = vec![];
+        // let identity = Transform3D::IDENTITY;
 
-        let identity = Transform3D::IDENTITY;
+        // for (idx, block) in self.voxels.grid.iter().enumerate() {
+        //     if *block == Block::None {
+        //         continue;
+        //     }
 
-        for (idx, block) in self.voxels.grid.iter().enumerate() {
-            if *block == Block::None {
-                continue;
-            }
+        //     // let mesh = ArrayMesh::new_gd();
+        //     // mesh.add_surface_from_arrays(PrimitiveType::TRIANGLES, arrays);
 
-            // let mesh = ArrayMesh::new_gd();
-            // mesh.add_surface_from_arrays(PrimitiveType::TRIANGLES, arrays);
+        //     let point = self.voxels.idx_to_point(idx).unwrap();
+        //     println!("[CubeSpawner] (ready) - Creating a cube at grid[{idx}] => {point:?}");
+        //     let mut cube = MeshInstance3D::new_alloc();
+        //     let mut box_mesh = BoxMesh::new_gd();
+        //     cube.set_mesh(&box_mesh);
 
-            let point = self.voxels.idx_to_point(idx);
-            println!("[CubeSpawner] (ready) - Creating a cube at grid[{idx}] => {point:?}");
-            let mut cube = MeshInstance3D::new_alloc();
-            let mut box_mesh = BoxMesh::new_gd();
-            cube.set_mesh(&box_mesh);
+        //     let material = block.to_material();
+        //     box_mesh.set_material(&material);
+        //     cube.set_transform(identity.translated(Vector3::new(
+        //         point.x as f32,
+        //         point.y as f32,
+        //         point.z as f32,
+        //     )));
 
-            let material = block.to_material();
-            box_mesh.set_material(&material);
-            cube.set_transform(identity.translated(Vector3::new(
-                point.x as f32,
-                point.y as f32,
-                point.z as f32,
-            )));
+        //     cubes.push(cube);
+        // }
 
-            cubes.push(cube);
-        }
-
-        for cube in &cubes {
-            self.base_mut().add_child(cube);
-        }
+        // for cube in &cubes {
+        //     self.base_mut().add_child(cube);
+        // }
 
         println!("[CubeSpawner] (ready) - Finish");
     }

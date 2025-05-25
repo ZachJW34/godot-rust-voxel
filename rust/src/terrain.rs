@@ -1,5 +1,5 @@
 use cgmath::Point3;
-use log::info;
+use godot::global::godot_print;
 use noise::{NoiseFn, Perlin};
 
 pub fn generate_terrain(
@@ -38,7 +38,7 @@ pub fn generate_terrain(
         .map(|v3| Point3::new(v3.x, v3.y / perlin_passes, v3.z))
         .collect();
 
-    info!("[terrain] (generate_terrain): t={:?})", t1.elapsed());
+    godot_print!("[terrain] (generate_terrain): t={:?})", t1.elapsed());
 
     terrain
 }
