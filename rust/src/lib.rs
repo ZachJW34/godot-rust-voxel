@@ -90,7 +90,9 @@ impl ToMaterial for Block {
         match self {
             Block::Grass => material.set_albedo(Color::from_rgb(0.1, 0.8, 0.1)),
             Block::Stone => material.set_albedo(Color::from_rgb(0.5, 0.5, 0.5)),
-            Block::None => material.set_albedo(Color::from_rgba(0.0, 0.0, 0.0, 0.0)), // or skip rendering
+            Block::None => material.set_albedo(Color::from_rgba(0.0, 0.0, 0.0, 0.0)),
+            Block::Dirt => todo!(),
+            Block::Snow => todo!(),
         }
 
         material
@@ -118,38 +120,101 @@ impl INode3D for CubeSpawner {
         println!("[CubeSpawner] (init)!");
         Self {
             base,
-            voxels: VoxelWorld::init(1, 1, 1),
+            voxels: VoxelWorld::init(5, 5, 5),
         }
     }
 
     fn ready(&mut self) {
-        // let terrain = terrain::generate_terrain(
-        //     self.voxels.x_chunks * CHUNK_SIZE,
-        //     self.voxels.z_chunks * CHUNK_SIZE,
-        //     0.05,
-        //     CHUNK_SIZE as f64,
-        //     1,
-        // );
-        // for point in terrain {
-        //     // godot_print!("[CubeSpawner] (ready) - adding block at {point:?}");
-        //     self.voxels.add_block(&point, Block::Grass);
-        //     for y in 0..point.y {
-        //         self.voxels
-        //             .add_block(&Point3::new(point.x, y, point.z), Block::Stone);
-        //     }
-        // }
-        self.voxels.add_block(&p(0, 0, 0), Block::Grass);
-        self.voxels.add_block(&p(1, 0, 0), Block::Grass);
-        self.voxels.add_block(&p(2, 0, 0), Block::Grass);
-        self.voxels.add_block(&p(0, 1, 0), Block::Grass);
-        self.voxels.add_block(&p(0, 2, 0), Block::Grass);
-        self.voxels.add_block(&p(0, 0, 1), Block::Stone);
-        self.voxels.add_block(&p(0, 0, 2), Block::Stone);
+        println!("[CubeSpawner] (ready) - Finish");
+        self.generate_voxels();
+        // self.render_individual_voxels();
+        self.render_chunked_voxels();
+        self.render_chunked_greedy_voxels();
+    }
+}
 
-        let atlas_texture = ResourceLoader::singleton()
+#[godot_api]
+impl CubeSpawner {
+    #[func]
+    fn generate_scene_voxels(&mut self) {
+        self.voxels.add_block(&p(0, 0, 0), Block::Grass);
+        self.voxels.add_block(&p(1, 0, 0), Block::Stone);
+        self.voxels.add_block(&p(0, 1, 0), Block::Snow);
+        self.voxels.add_block(&p(1, 1, 0), Block::Dirt);
+
+        self.render_chunked_voxels();
+    }
+
+    fn generate_voxels(&mut self) {
+        let terrain = terrain::generate_terrain(
+            self.voxels.x_chunks * CHUNK_SIZE,
+            self.voxels.z_chunks * CHUNK_SIZE,
+            0.05,
+            CHUNK_SIZE as f64,
+            1,
+        );
+        for point in terrain {
+            // godot_print!("[CubeSpawner] (ready) - adding block at {point:?}");
+            self.voxels.add_block(&point, Block::Grass);
+            for y in 0..point.y {
+                self.voxels
+                    .add_block(&Point3::new(point.x, y, point.z), Block::Dirt);
+            }
+        }
+        // self.voxels.add_block(&p(0, 0, 0), Block::Grass);
+        // self.voxels.add_block(&p(1, 0, 0), Block::Stone);
+        // self.voxels.add_block(&p(0, 1, 0), Block::Snow);
+        // self.voxels.add_block(&p(1, 1, 0), Block::Dirt);
+        // self.voxels.add_block(&p(0, 1, 0), Block::Grass);
+        // self.voxels.add_block(&p(2, 0, 0), Block::Grass);
+        // self.voxels.add_block(&p(0, 2, 0), Block::Grass);
+        // self.voxels.add_block(&p(0, 0, 1), Block::Stone);
+        // self.voxels.add_block(&p(0, 0, 2), Block::Stone);
+    }
+
+    fn render_individual_voxels(&mut self) {
+        let mut cubes: Vec<Gd<MeshInstance3D>> = vec![];
+        let identity = Transform3D::IDENTITY;
+
+        for (idx, block) in self.voxels.grid.iter().enumerate() {
+            if *block == Block::None {
+                continue;
+            }
+
+            let point = match self.voxels.idx_to_point(idx) {
+                Some(p) => p,
+                None => continue,
+            };
+            println!("[CubeSpawner] (ready) - Creating a cube at grid[{idx}] => {point:?}");
+            let mut cube = MeshInstance3D::new_alloc();
+            let mut box_mesh = BoxMesh::new_gd();
+            cube.set_mesh(&box_mesh);
+
+            let material = block.to_material();
+            box_mesh.set_material(&material);
+            cube.set_transform(identity.translated(Vector3::new(
+                point.x as f32,
+                point.y as f32,
+                point.z as f32,
+            )));
+
+            cubes.push(cube);
+        }
+
+        for cube in &cubes {
+            self.base_mut().add_child(cube);
+        }
+    }
+
+    fn render_chunked_voxels(&mut self) {
+        let atlas_texture_color = ResourceLoader::singleton()
             .load("res://textures/atlas_color.png")
             .unwrap()
             .cast::<Texture2D>();
+        // let atlas_texture_normal = ResourceLoader::singleton()
+        //     .load("res://textures/atlas_normalmap.png")
+        //     .unwrap()
+        //     .cast::<Texture2D>();
 
         let chunks = self.voxels.mesh_chunks();
 
@@ -164,6 +229,7 @@ impl INode3D for CubeSpawner {
             let normals = PackedVector3Array::from_iter(
                 vertices.iter().map(|v| Vector3::from_array(v.normal)),
             );
+            let tangents = PackedFloat32Array::from_iter(vertices.iter().flat_map(|v| v.tangent));
             let uvs = PackedVector2Array::from_iter(
                 vertices.iter().map(|v| Vector2::from_array(v.tex_coords)),
             );
@@ -171,51 +237,26 @@ impl INode3D for CubeSpawner {
 
             array.set(ARRAY_VERTEX, &positions.to_variant());
             array.set(ARRAY_NORMAL, &normals.to_variant());
+            array.set(ARRAY_TANGENT, &tangents.to_variant());
             array.set(ARRAY_TEX_UV, &uvs.to_variant());
             array.set(ARRAY_INDEX, &indices.to_variant());
 
+            let mut material = StandardMaterial3D::new_gd();
+            material.set_texture(TextureParam::ALBEDO, &atlas_texture_color);
+            // material.set_texture(TextureParam::NORMAL, &atlas_texture_normal);
+            // material.set_normal_scale(100.0);
+
             let mut mesh = ArrayMesh::new_gd();
             mesh.add_surface_from_arrays(PrimitiveType::TRIANGLES, &array);
-            let mut material = StandardMaterial3D::new_gd();
-            material.set_texture(TextureParam::ALBEDO, &atlas_texture);
             mesh.surface_set_material(0, &material);
+
             let mut mesh_instance = MeshInstance3D::new_alloc();
             mesh_instance.set_mesh(&mesh);
             self.base_mut().add_child(&mesh_instance);
         }
+    }
 
-        // let mut cubes: Vec<Gd<MeshInstance3D>> = vec![];
-        // let identity = Transform3D::IDENTITY;
-
-        // for (idx, block) in self.voxels.grid.iter().enumerate() {
-        //     if *block == Block::None {
-        //         continue;
-        //     }
-
-        //     // let mesh = ArrayMesh::new_gd();
-        //     // mesh.add_surface_from_arrays(PrimitiveType::TRIANGLES, arrays);
-
-        //     let point = self.voxels.idx_to_point(idx).unwrap();
-        //     println!("[CubeSpawner] (ready) - Creating a cube at grid[{idx}] => {point:?}");
-        //     let mut cube = MeshInstance3D::new_alloc();
-        //     let mut box_mesh = BoxMesh::new_gd();
-        //     cube.set_mesh(&box_mesh);
-
-        //     let material = block.to_material();
-        //     box_mesh.set_material(&material);
-        //     cube.set_transform(identity.translated(Vector3::new(
-        //         point.x as f32,
-        //         point.y as f32,
-        //         point.z as f32,
-        //     )));
-
-        //     cubes.push(cube);
-        // }
-
-        // for cube in &cubes {
-        //     self.base_mut().add_child(cube);
-        // }
-
-        println!("[CubeSpawner] (ready) - Finish");
+    fn render_chunked_greedy_voxels(&mut self) {
+        self.voxels.mesh_chunks_greedy();
     }
 }
