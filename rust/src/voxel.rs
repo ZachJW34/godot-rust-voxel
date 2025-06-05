@@ -1,19 +1,301 @@
-use block_mesh::{
-    Axis, GreedyQuadsBuffer, MergeVoxel, OrientedBlockFace, RIGHT_HANDED_Y_UP_CONFIG,
-    UnorientedQuad, Voxel, greedy_quads, ndshape::ConstShape3u32,
-};
-use cgmath::{Point3, Vector3};
-use godot::{classes::StandardMaterial3D, global::godot_print, obj::Gd};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::{collections::HashMap, sync::Arc};
 
-pub const CHUNK_SIZE: usize = 32;
-pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
-pub const PADDING: usize = 1;
-pub const CHUNK_SIZE_PADDED: usize = CHUNK_SIZE + PADDING + PADDING;
-pub const CHUNK_VOLUME_PADDED: usize = CHUNK_SIZE_PADDED * CHUNK_SIZE_PADDED * CHUNK_SIZE_PADDED;
-const PLANE_OFFSET: usize = PADDING * CHUNK_SIZE_PADDED * CHUNK_SIZE_PADDED;
-const ROW_OFFSET: usize = PADDING * CHUNK_SIZE_PADDED;
-const COLUMN_OFFSET: usize = PADDING;
-const START_OFFSET: usize = COLUMN_OFFSET + ROW_OFFSET + PLANE_OFFSET;
+use block_mesh::{
+    GreedyQuadsBuffer, MergeVoxel, QuadBuffer, QuadCoordinateConfig, RIGHT_HANDED_Y_UP_CONFIG,
+    UnitQuadBuffer, Voxel, greedy_quads,
+    ndshape::{ConstShape, ConstShape3i32, ConstShape3u32},
+    visible_block_faces,
+};
+use crossbeam::queue::{ArrayQueue, SegQueue};
+use dashmap::DashMap;
+use glam::IVec3;
+use godot::global::godot_print;
+use rayon::{
+    ThreadPool, ThreadPoolBuilder,
+    iter::{IntoParallelRefIterator, ParallelIterator},
+};
+
+use crate::terrain::generate_chunk;
+
+pub const CHUNK_SIZE_I: i32 = 32;
+pub const CHUNK_VOLUME: usize = (CHUNK_SIZE_I * CHUNK_SIZE_I * CHUNK_SIZE_I) as usize;
+pub const CHUNK_SIZE_I_PADDED: i32 = 32 + 2;
+// pub const CHUNK_SIZE_U: u32 = CHUNK_SIZE_I as u32;
+pub const CHUNK_SIZE_U_PADDED: u32 = CHUNK_SIZE_I_PADDED as u32;
+// pub type ChunkShapeU =
+//     ConstShape3u32<CHUNK_SIZE_U_PADDED, CHUNK_SIZE_U_PADDED, CHUNK_SIZE_U_PADDED>;
+
+pub struct VoxelWorld {
+    chunks: Arc<DashMap<IVec3, Chunk32>>,
+    pub render_queue: Arc<DashMap<IVec3, ChunkMesh>>,
+    mesh_thread_pool: Arc<ThreadPool>,
+    radius_h: usize,
+    radius_v: usize,
+    mesh_queue: ArrayQueue<IVec3>,
+    meshing_queue: Arc<SegQueue<IVec3>>,
+}
+
+impl VoxelWorld {
+    pub fn new(radius_h: usize, radius_v: usize) -> Self {
+        Self {
+            chunks: Arc::new(DashMap::new()),
+            render_queue: Arc::new(DashMap::new()),
+            mesh_thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
+            radius_h,
+            radius_v,
+            mesh_queue: ArrayQueue::new(2 * radius_h * 2 * radius_h * 2 * radius_v),
+            meshing_queue: Arc::new(SegQueue::new()),
+        }
+    }
+
+    pub fn add_change(&mut self, wv: &IVec3, new_block: Block) -> Block {
+        let chunk_v = wv_to_chunk_v(wv);
+        if !self.chunks.contains_key(&chunk_v) {
+            self.chunks.insert(chunk_v, Chunk32::empty());
+        }
+
+        let mut chunk = self.chunks.get_mut(&chunk_v).unwrap();
+        let old_block = chunk.add_change(wv, new_block);
+        self.mesh_queue.force_push(chunk_v);
+
+        old_block
+    }
+
+    pub fn reset_mesh(&mut self) {
+        self.render_queue.clear();
+        self.chunks.alter_all(|_, mut chunk| {
+            chunk.pipeline = Pipeline::NeedsFastMesh;
+            chunk
+        });
+    }
+
+    pub fn remove_generated(&mut self) {
+        self.render_queue.clear();
+        self.chunks.alter_all(|_, mut chunk| {
+            chunk.voxels = Chunk32::empty().voxels;
+            chunk.generated = false;
+            if chunk.changes.len() > 0 {
+                chunk.pipeline = Pipeline::NeedsFastMesh;
+            }
+
+            chunk
+        });
+    }
+
+    pub fn queue_chunks_to_mesh(&mut self, camera_pos: &IVec3) {
+        let camera_chunk_v = wv_to_chunk_v(camera_pos);
+
+        let radius_h = self.radius_h as i32;
+        let radius_v = self.radius_v as i32;
+
+        let mut chunk_vs = Vec::with_capacity(self.radius_h * self.radius_h * self.radius_v);
+
+        for x in -radius_h..radius_h {
+            for y in -radius_v..radius_v {
+                for z in -radius_h..radius_h {
+                    let wv = IVec3 {
+                        x: camera_pos.x + (x * CHUNK_SIZE_I),
+                        y: camera_pos.y + (y * CHUNK_SIZE_I),
+                        z: camera_pos.z + (z * CHUNK_SIZE_I),
+                    };
+
+                    let chunk_v = wv_to_chunk_v(&wv);
+                    chunk_vs.push(chunk_v);
+                    // let contains_key = self.chunks.contains_key(&chunk_v);
+                    // if !contains_key {
+                    //     let mut new_chunk = Chunk32::empty();
+                    //     new_chunk.pipeline = Pipeline::NeedsFastMesh;
+
+                    //     self.chunks.insert(chunk_v, new_chunk);
+                    // }
+
+                    // if contains_key && self.chunks.get(&chunk_v).unwrap().pipeline == Pipeline::None
+                    // {
+                    //     let mut chunk = self.chunks.get_mut(&chunk_v).unwrap();
+                    //     chunk.pipeline = Pipeline::NeedsFastMesh
+                    // }
+                }
+            }
+        }
+
+        chunk_vs.sort_by_key(|chunk_v| (camera_chunk_v - chunk_v).length_squared());
+        chunk_vs.into_iter().for_each(|chunk| {
+            self.mesh_queue.force_push(chunk);
+        });
+    }
+
+    pub fn mesh_queued_chunks(&mut self, camera_pos: &IVec3, procedural: bool) {
+        let t1 = std::time::Instant::now();
+
+        // let mut chunks_to_mesh: Vec<_> = self
+        //     .chunks
+        //     .iter()
+        //     .filter_map(|entry| {
+        //         matches!(entry.pipeline, Pipeline::NeedsFastMesh).then_some(entry.key().clone())
+        //     })
+        //     .collect();
+
+        // chunks_to_mesh.sort_by_key(|cp| (cp * CHUNK_SIZE_I - camera_pos).length_squared());
+
+        // if chunks_to_mesh.len() > 0 {
+        //     godot_print!(
+        //         "[VoxelWorld] (mesh_queued_chunks) - t={:?} len={}",
+        //         t1.elapsed(),
+        //         chunks_to_mesh.len()
+        //     );
+        // }
+
+        // let chunk_to_mesh = chunks_to_mesh.get(0);
+        // if chunk_to_mesh.is_none() {
+        //     return;
+        // }
+        // let chunk_to_mesh = chunk_to_mesh.unwrap().clone();
+        // let mut chunk = self.chunks.get_mut(&chunk_to_mesh).unwrap();
+        // chunk.pipeline = Pipeline::Meshing;
+
+        // drop(chunk);
+
+        // let meshing_count = self
+        //     .chunks
+        //     .iter()
+        //     .filter(|entry| matches!(entry.pipeline, Pipeline::Meshing))
+        //     .count();
+        let meshing_count = self.meshing_queue.len();
+
+        let available_tasks = self
+            .mesh_thread_pool
+            .current_num_threads()
+            .saturating_sub(meshing_count);
+
+        if available_tasks == 0 {
+            return;
+        }
+
+        let mut chunks_to_mesh = vec![];
+        for _ in 0..self.mesh_queue.len() {
+            if chunks_to_mesh.len() >= available_tasks * 2 {
+                break;
+            }
+            if let Some(chunk_v) = self.mesh_queue.pop() {
+                if !self.chunks.contains_key(&chunk_v) {
+                    let mut new_chunk = Chunk32::empty();
+                    new_chunk.pipeline = Pipeline::NeedsFastMesh;
+                    self.chunks.insert(chunk_v, new_chunk);
+                }
+
+                if self.chunks.get(&chunk_v).unwrap().pipeline == Pipeline::NeedsFastMesh {
+                    chunks_to_mesh.push(chunk_v);
+                }
+            }
+        }
+
+        if chunks_to_mesh.len() > 0 {
+            // godot_print!(
+            //     "Available tasks: {available_tasks} meshing_count: {meshing_count} threads: {} meshing_queue.len: {} chunks_to_mesh: {:?}",
+            //     self.mesh_thread_pool.current_num_threads(),
+            //     self.mesh_queue.len(),
+            //     chunks_to_mesh
+            // );
+        }
+
+        let camera_chunk_v = wv_to_chunk_v(camera_pos);
+        for chunk_v in &chunks_to_mesh {
+            let mut chunk = self.chunks.get_mut(chunk_v).unwrap();
+            chunk.pipeline = Pipeline::Meshing;
+            self.meshing_queue.push(*chunk_v);
+        }
+
+        let render_queue = self.render_queue.clone();
+        let chunks = self.chunks.clone();
+        let pool = self.mesh_thread_pool.clone();
+        let meshing_queue = self.meshing_queue.clone();
+
+        godot::task::spawn(async move {
+            for chunk_v in chunks_to_mesh {
+                let chunks = chunks.clone();
+                let render_queue = render_queue.clone();
+                let meshing_queue = meshing_queue.clone();
+                pool.spawn(move || {
+                    let chunk = chunks.get(&chunk_v).unwrap();
+                    let mut working_chunk = chunk.clone();
+                    drop(chunk);
+
+                    if procedural && !working_chunk.generated {
+                        let chunk_wv = chunk_v_to_wv(&chunk_v);
+                        generate_chunk(
+                            &chunk_wv,
+                            1234,
+                            working_chunk.shape(),
+                            &mut working_chunk.voxels,
+                        );
+                        working_chunk.generated = true;
+                    }
+
+                    let chunk = working_chunk.clone();
+                    chunks.insert(chunk_v, chunk);
+
+                    let merged_voxels = working_chunk.merge_changes();
+                    // let mut buffer = UnitQuadBuffer::new();
+                    // visible_block_faces(
+                    //     &merged_voxels.voxels,
+                    //     &ChunkShapeU {},
+                    //     [0; 3],
+                    //     [33; 3],
+                    //     &RIGHT_HANDED_Y_UP_CONFIG.faces,
+                    //     &mut buffer,
+                    // );
+
+                    let mut buffer = GreedyQuadsBuffer::new(CHUNK_VOLUME * 6);
+                    greedy_quads(
+                        &merged_voxels.voxels,
+                        &merged_voxels.shape(),
+                        [0; 3],
+                        [33; 3],
+                        &RIGHT_HANDED_Y_UP_CONFIG.faces,
+                        &mut buffer,
+                    );
+
+                    let mesh = if buffer.quads.num_quads() == 0 {
+                        ChunkMesh {
+                            indices: vec![],
+                            positions: vec![],
+                            normals: vec![],
+                            uvs: vec![],
+                            layers: vec![],
+                            tangents: vec![],
+                        }
+                    } else {
+                        let chunk_offset = [
+                            (chunk_v.x * CHUNK_SIZE_I) as f32,
+                            (chunk_v.y * CHUNK_SIZE_I) as f32,
+                            (chunk_v.z * CHUNK_SIZE_I) as f32,
+                        ];
+
+                        build_mesh_from_quads(
+                            buffer.quads,
+                            &merged_voxels,
+                            &RIGHT_HANDED_Y_UP_CONFIG,
+                            &chunk_offset,
+                        )
+                    };
+
+                    render_queue.insert(chunk_v, mesh);
+                    meshing_queue.pop();
+
+                    // let mut file = OpenOptions::new()
+                    //     .create(true)
+                    //     .append(true)
+                    //     .open("log.txt")
+                    //     .unwrap();
+
+                    // writeln!(file, "thread t={:?}", t1.elapsed()).unwrap();
+                })
+            }
+        });
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Copy, Debug)]
 pub enum Block {
@@ -42,578 +324,246 @@ impl MergeVoxel for Block {
 }
 
 impl Block {
-    pub fn atlas_uv(&self) -> (u8, u8) {
+    pub fn layer_idx(&self) -> f32 {
         match self {
-            Block::Grass => (0, 0),
-            Block::Stone => (1, 0),
-            Block::Dirt => (0, 1),
-            Block::Snow => (1, 1),
-            Block::None => panic!("Can't get uv for None"),
+            Block::Grass => 0.0,
+            Block::Dirt => 1.0,
+            Block::Stone => 2.0,
+            Block::Snow => 3.0,
+            Block::None => panic!("Can't get layer_idx for None"),
         }
     }
 }
 
-pub trait ToMaterial {
-    fn to_material(&self) -> Gd<StandardMaterial3D>;
+impl From<i32> for Block {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => Block::None,
+            1 => Block::Dirt,
+            2 => Block::Grass,
+            3 => Block::Stone,
+            4 => Block::Snow,
+            _ => panic!("Don't have a Block::from({value}) implemented"),
+        }
+    }
 }
 
-pub struct VoxelWorld {
-    pub x_chunks: usize,
-    pub y_chunks: usize,
-    pub z_chunks: usize,
-    pub grid: Vec<Block>,
-    total_chunks: usize,
-    max_x: usize,
-    max_y: usize,
-    max_z: usize,
+#[derive(Clone, PartialEq)]
+pub enum Pipeline {
+    None,
+    NeedsFastMesh,
+    Meshing,
+    Meshed,
+    Rendered,
 }
 
-impl VoxelWorld {
-    pub fn init(x_chunks: usize, y_chunks: usize, z_chunks: usize) -> Self {
-        let total_blocks = x_chunks * y_chunks * z_chunks * CHUNK_VOLUME_PADDED;
-        godot_print!("[VoxelWorld] (init) - total_blocks: {total_blocks}");
+pub type Chunk32Shape = ConstShape3i32<32, 32, 32>;
+
+#[derive(Clone)]
+pub struct Chunk32 {
+    voxels: [Block; 32 * 32 * 32],
+    changes: HashMap<IVec3, Block>,
+    generated: bool,
+    pipeline: Pipeline,
+}
+
+impl Chunk32 {
+    fn empty() -> Self {
         Self {
-            x_chunks,
-            y_chunks,
-            z_chunks,
-            grid: vec![Block::None; total_blocks],
-            total_chunks: x_chunks * y_chunks * z_chunks,
-            max_x: x_chunks * CHUNK_SIZE,
-            max_y: y_chunks * CHUNK_SIZE,
-            max_z: z_chunks * CHUNK_SIZE,
+            voxels: [Block::None; 32 * 32 * 32],
+            changes: HashMap::new(),
+            generated: false,
+            pipeline: Pipeline::None,
         }
     }
 
-    pub fn point_to_idx(&self, point: &Point3<usize>) -> Option<usize> {
-        if point.x >= self.max_x || point.y >= self.max_y || point.z >= self.max_z {
-            return None;
-        }
+    pub fn add_change(&mut self, wv: &IVec3, new_block: Block) -> Block {
+        let voxel_v = wv_to_voxel_v(wv);
+        let old_block = self.changes.insert(voxel_v, new_block).unwrap_or_else(|| {
+            let idx = self.linearize(&voxel_v);
+            godot_print!(
+                "[VoxelWorld2] (add_change) - wv: {wv} => voxel_v: {voxel_v} => idx: {idx}"
+            );
+            self.voxels[idx]
+        });
 
-        // Determine chunk
-        let chunk_x = point.x / CHUNK_SIZE;
-        let chunk_y = point.y / CHUNK_SIZE;
-        let chunk_z = point.z / CHUNK_SIZE;
-        let chunk_index =
-            chunk_x + chunk_y * self.x_chunks + chunk_z * self.x_chunks * self.y_chunks;
-        let chunk_offset = chunk_index * CHUNK_VOLUME_PADDED;
+        self.pipeline = Pipeline::NeedsFastMesh;
 
-        let local_x: usize = point.x % CHUNK_SIZE;
-        let local_y = point.y % CHUNK_SIZE;
-        let local_z = point.z % CHUNK_SIZE;
-
-        // Convert to padded chunk-local coordinates
-        let local_index = (local_x + PADDING)
-            + (local_y + PADDING) * CHUNK_SIZE_PADDED
-            + (local_z + PADDING) * CHUNK_SIZE_PADDED * CHUNK_SIZE_PADDED;
-
-        Some(chunk_offset + local_index)
+        old_block
     }
 
-    pub fn idx_to_point(&self, idx: usize) -> Option<Point3<usize>> {
-        if idx >= self.grid.len() {
-            return None;
-        }
-
-        let chunk_index = idx / CHUNK_VOLUME_PADDED;
-        let local_index = idx % CHUNK_VOLUME_PADDED;
-
-        let chunk_x = chunk_index % self.x_chunks;
-        let chunk_y = (chunk_index / self.x_chunks) % self.y_chunks;
-        let chunk_z = chunk_index / (self.x_chunks * self.y_chunks);
-
-        let lx = local_index % CHUNK_SIZE_PADDED;
-        let ly = (local_index / CHUNK_SIZE_PADDED) % CHUNK_SIZE_PADDED;
-        let lz = local_index / (CHUNK_SIZE_PADDED * CHUNK_SIZE_PADDED);
-
-        // Remove padding offset
-        if lx < PADDING || ly < PADDING || lz < PADDING {
-            return None; // padding area, not a valid world voxel
-        }
-
-        Some(Point3 {
-            x: chunk_x * CHUNK_SIZE + (lx - PADDING),
-            y: chunk_y * CHUNK_SIZE + (ly - PADDING),
-            z: chunk_z * CHUNK_SIZE + (lz - PADDING),
-        })
+    fn linearize(&self, voxel_v: &IVec3) -> usize {
+        Chunk32Shape::linearize(voxel_v.to_array()) as usize
     }
 
-    pub fn add_block(&mut self, point: &Point3<usize>, new_block: Block) -> Block {
-        let idx = self.point_to_idx(point).unwrap();
-        // godot_print!("Putting {new_block:?} at {point:?} => {idx}");
-        std::mem::replace(&mut self.grid[idx], new_block)
-    }
+    pub fn merge_changes(self) -> Chunk34 {
+        let mut voxels = [Block::None; 34 * 34 * 34];
 
-    pub fn remove_block(&mut self, point: &Point3<usize>) -> Block {
-        let idx = self.point_to_idx(&point).unwrap();
-        std::mem::replace(&mut self.grid[idx], Block::None)
-    }
+        let size = 32;
+        for z in 0..size {
+            for y in 0..size {
+                for x in 0..size {
+                    let voxel_v = IVec3::new(x, y, z);
+                    let idx = self.linearize(&voxel_v);
+                    let block = self
+                        .changes
+                        .get(&voxel_v)
+                        .unwrap_or_else(|| &self.voxels[idx]);
 
-    pub fn mesh_chunks(&mut self) -> Vec<(Vec<ModelVertex>, Vec<i32>)> {
-        let t1 = std::time::Instant::now();
-        let mut chunks = vec![];
+                    // Offset by 1 to account for padding
+                    let dst_x = (x + 1) as u32;
+                    let dst_y = (y + 1) as u32;
+                    let dst_z = (z + 1) as u32;
+                    let dst_idx = Chunk34Shape::linearize([dst_x, dst_y, dst_z]) as usize;
 
-        for chunk in 0..self.total_chunks {
-            let idx: usize = chunk * CHUNK_VOLUME_PADDED;
-            // godot_print!("Starting mesh of chunk={chunk} => idx={idx}");
-            if let Some(chunk) = self.mesh_chunk(idx) {
-                chunks.push(chunk)
-            }
-        }
-
-        godot_print!("Total mesh chunk time: {:?}", t1.elapsed());
-
-        chunks
-    }
-
-    // start_idx is the start of the padded chunk
-    pub fn mesh_chunk(&self, start_idx: usize) -> Option<(Vec<ModelVertex>, Vec<i32>)> {
-        // let t1 = std::time::Instant::now();
-
-        let mut vertices: Vec<ModelVertex> = vec![];
-        let mut indices: Vec<i32> = vec![];
-
-        let start_idx = start_idx + START_OFFSET;
-        let start_point = self.idx_to_point(start_idx).unwrap();
-        // godot_print!("start_idx={start_idx} start_point={start_point:?}");
-
-        for z in 0..CHUNK_SIZE {
-            for y in 0..CHUNK_SIZE {
-                for x in 0..CHUNK_SIZE {
-                    let cur_point = start_point + Vector3::new(x, y, z);
-                    let cur_idx = self.point_to_idx(&cur_point).unwrap();
-                    let cur_voxel = &self.grid[cur_idx];
-
-                    // godot_print!("{cur_point:?} ({cur_idx}) = {cur_voxel:?}");
-
-                    if *cur_voxel == Block::None {
-                        // godot_print!("  Skipping");
-                        continue;
-                    }
-
-                    // godot_print!("  Meshing...");
-
-                    for face in ALL_FACES {
-                        let (adj_point, adj_point_raw) =
-                            offset_point_safe(&cur_point, &face.normal.into());
-                        let adj_voxel = adj_point
-                            .and_then(|p| self.point_to_idx(&p))
-                            .and_then(|idx| Some(&self.grid[idx]))
-                            .or(Some(&Block::None))
-                            .unwrap();
-                        // let adj_voxel = offset_point_safe(&cur_point, &face.normal.into())
-                        //     .and_then(|p| self.point_to_idx(&p))
-                        //     .and_then(|idx| Some(&self.grid[idx]))
-                        //     .or(Some(&Block::None))
-                        //     .unwrap();
-
-                        let msg = if *adj_voxel == Block::None {
-                            format!("Meshing...")
-                        } else {
-                            format!("Skipping")
-                        };
-
-                        // godot_print!(
-                        //     "   {:?} -> {:?} = {:?}: {}",
-                        //     face.face,
-                        //     adj_point_raw,
-                        //     adj_voxel,
-                        //     msg
-                        // );
-
-                        if *adj_voxel == Block::None {
-                            // godot_print!(
-                            //     "{:?} -> {:?} = {:?}: {:?} will be meshed",
-                            //     cur_point,
-                            //     adj_point,
-                            //     adj_voxel,
-                            //     face.face
-                            // );
-                            generate_face(
-                                &face,
-                                &mut vertices,
-                                &mut indices,
-                                cur_point,
-                                cur_voxel.atlas_uv(),
-                            );
-                        }
-                    }
+                    voxels[dst_idx] = *block;
                 }
             }
         }
 
-        // godot_print!("Mesh chunk time: {:?}", t1.elapsed());
-
-        if vertices.len() == 0 {
-            None
-        } else {
-            Some((vertices, indices))
-        }
+        Chunk34 { voxels }
     }
 
-    pub fn mesh_chunks_greedy(&self) {
-        type ChunkShape = ConstShape3u32<34, 34, 34>;
-        let mut buffer = GreedyQuadsBuffer::new(self.grid.len());
-        let config = RIGHT_HANDED_Y_UP_CONFIG;
-        greedy_quads(
-            &self.grid,
-            &ChunkShape {},
-            [0; 3],
-            [33; 3],
-            &RIGHT_HANDED_Y_UP_CONFIG.faces,
-            &mut buffer,
-        );
-
-        let res = build_mesh_from_quads(&buffer, 1.0, config.u_flip_face, true);
+    pub fn shape(&self) -> Chunk32Shape {
+        Chunk32Shape {}
     }
 }
 
+pub type Chunk34Shape = ConstShape3u32<34, 34, 34>;
+pub struct Chunk34 {
+    voxels: [Block; 34 * 34 * 34],
+}
+
+impl Chunk34 {
+    pub fn linearize(&self, p: [u32; 3]) -> usize {
+        Chunk34Shape::linearize(p) as usize
+    }
+
+    pub fn shape(&self) -> Chunk34Shape {
+        Chunk34Shape {}
+    }
+}
+
+pub fn wv_to_chunk_v(wv: &IVec3) -> IVec3 {
+    wv.div_euclid(IVec3::splat(CHUNK_SIZE_I))
+}
+
+fn chunk_v_to_wv(chunk_v: &IVec3) -> IVec3 {
+    chunk_v * CHUNK_SIZE_I
+}
+
+fn wv_to_voxel_v(wv: &IVec3) -> IVec3 {
+    wv.rem_euclid(IVec3::splat(CHUNK_SIZE_I))
+}
+
 #[derive(Debug)]
-struct Vertex {
-    position: [f32; 3],
-    normal: [f32; 3],
-    uv: [f32; 2],
+pub struct ChunkMesh {
+    pub indices: Vec<u32>,
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub uvs: Vec<[f32; 2]>,
+    pub layers: Vec<f32>,
+    pub tangents: Vec<[f32; 4]>,
+}
+
+impl ChunkMesh {
+    fn vert_to_idx(&self, vert: usize) -> usize {
+        self.indices[3 * 3 + vert] as usize
+    }
+}
+
+impl mikktspace::Geometry for ChunkMesh {
+    fn num_faces(&self) -> usize {
+        self.indices.len() / 3
+    }
+
+    fn num_vertices_of_face(&self, _face: usize) -> usize {
+        3
+    }
+
+    fn position(&self, _face: usize, vert: usize) -> [f32; 3] {
+        self.positions[self.vert_to_idx(vert)]
+    }
+
+    fn normal(&self, _face: usize, vert: usize) -> [f32; 3] {
+        self.normals[self.vert_to_idx(vert)]
+    }
+
+    fn tex_coord(&self, _face: usize, vert: usize) -> [f32; 2] {
+        self.uvs[self.vert_to_idx(vert)]
+    }
+
+    fn set_tangent(
+        &mut self,
+        tangent: [f32; 3],
+        _bi_tangent: [f32; 3],
+        _f_mag_s: f32,
+        _f_mag_t: f32,
+        bi_tangent_preserves_orientation: bool,
+        _face: usize,
+        vert: usize,
+    ) {
+        let idx = self.vert_to_idx(vert);
+        let w = if bi_tangent_preserves_orientation {
+            1.0
+        } else {
+            -1.0
+        };
+        self.tangents[idx] = [tangent[0], tangent[1], tangent[2], w];
+    }
 }
 
 fn build_mesh_from_quads(
-    buffer: &GreedyQuadsBuffer,
-    voxel_size: f32,
-    u_flip_face: Axis,
-    flip_v: bool,
-) -> (Vec<Vertex>, Vec<u32>) {
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    let mut next_index = 0;
+    buffer: QuadBuffer,
+    chunk: &Chunk34,
+    config: &QuadCoordinateConfig,
+    chunk_offset: &[f32; 3],
+) -> ChunkMesh {
+    let num_indices = buffer.num_quads() * 6;
+    let num_vertices = buffer.num_quads() * 4;
 
-    for (group_index, group) in buffer.quads.groups.iter().enumerate() {
-        let face = &RIGHT_HANDED_Y_UP_CONFIG.faces[group_index];
+    let mut indices = Vec::with_capacity(num_indices);
+    let mut positions = Vec::with_capacity(num_vertices);
+    let mut normals = Vec::with_capacity(num_vertices);
+    let mut uvs = Vec::with_capacity(num_vertices);
+    let mut layers = Vec::with_capacity(num_vertices);
+    let tangents = vec![[0.0; 4]; num_vertices];
 
-        for quad in group {
-            // Get vertex positions in world space
-            let positions = face.quad_mesh_positions(quad, voxel_size);
-            let normals = face.quad_mesh_normals();
-            let uvs = face.tex_coords(u_flip_face, flip_v, quad);
-
-            // Build vertex data
-            for i in 0..4 {
-                vertices.push(Vertex {
-                    position: positions[i],
-                    normal: normals[i],
-                    uv: uvs[i],
-                });
+    for (group, face) in buffer.groups.into_iter().zip(config.faces.into_iter()) {
+        for quad in group.into_iter() {
+            let mut new_indices = face.quad_mesh_indices(positions.len() as u32);
+            let mut new_positions = face.quad_mesh_positions(&quad.into(), 1.0);
+            for v in &mut new_positions {
+                for i in 0..3 {
+                    v[i] = v[i] - 1.0 + chunk_offset[i];
+                }
             }
+            let new_normals = face.quad_mesh_normals();
+            let new_uvs = face.tex_coords(config.u_flip_face, true, &quad.into());
 
-            // Add triangle indices
-            let quad_indices = face.quad_mesh_indices(next_index);
-            indices.extend_from_slice(&quad_indices);
-            next_index += 4;
+            let voxel_index = chunk.linearize(quad.minimum) as usize;
+            let voxel_type = chunk.voxels[voxel_index];
+            let layer_idx = voxel_type.layer_idx();
+            let new_layers = &[layer_idx; 4];
+
+            // TODO: This is fuarked, there is a winding problem
+            new_indices.swap(1, 2);
+            new_indices.swap(4, 5);
+
+            indices.extend_from_slice(&new_indices);
+            positions.extend_from_slice(&new_positions);
+            normals.extend_from_slice(&new_normals);
+            uvs.extend_from_slice(&new_uvs);
+            layers.extend_from_slice(new_layers);
         }
     }
 
-    (vertices, indices)
-}
-
-// struct Vertex {
-//     position: [f32; 3],
-//     normal: [f32; 3],
-//     uv: [f32; 2],
-// }
-
-// fn build_mesh_from_quads(
-//     buffer: &GreedyQuadsBuffer,
-//     voxel_size: f32,
-//     u_flip_face: Axis,
-//     flip_v: bool,
-//     atlas_layout: &TextureAtlasLayout, // Add atlas layout information
-//     get_block_type: impl Fn(usize) -> u32, // Add block type lookup function
-// ) -> (Vec<Vertex>, Vec<u32>) {
-//     let mut vertices = Vec::new();
-//     let mut indices = Vec::new();
-//     let mut next_index = 0;
-
-//     for (group_index, group) in buffer.quads.groups.iter().enumerate() {
-//         let face = &RIGHT_HANDED_Y_UP_CONFIG.faces[group_index];
-
-//         for (quad_index, quad) in group.iter().enumerate() {
-//             // Get block type based on quad index
-//             let block_type = get_block_type(quad_index);
-
-//             // Calculate UV offset in the texture atlas based on block type
-//             let atlas_index = block_type; // Or however you map block type to atlas index
-
-//             let u_offset = (atlas_index % atlas_layout.columns) as f32 * atlas_layout.cell_width;
-//             let v_offset = (atlas_index / atlas_layout.columns) as f32 * atlas_layout.cell_height;
-
-//             // Get vertex positions in world space
-//             let positions = face.quad_mesh_positions(quad, voxel_size);
-//             let normals = face.quad_mesh_normals();
-//             let base_uvs = face.tex_coords(u_flip_face, flip_v, quad);
-
-//             // Build vertex data with atlas UVs
-//             for i in 0..4 {
-//                  let uv = [
-//                     base_uvs[i][0] * atlas_layout.cell_width + u_offset,
-//                     base_uvs[i][1] * atlas_layout.cell_height + v_offset,
-//                     ];
-//                  vertices.push(Vertex {
-//                     position: positions[i],
-//                     normal: normals[i],
-//                     uv,
-//                  });
-//             }
-
-//             // Add triangle indices
-//             let quad_indices = face.quad_mesh_indices(next_index);
-//             indices.extend_from_slice(&quad_indices);
-//             next_index += 4;
-//         }
-//     }
-
-//     (vertices, indices)
-// }
-
-// struct TextureAtlasLayout {
-//     columns: u32,
-//     rows: u32,
-//     cell_width: f32,
-//     cell_height: f32,
-// }
-
-fn offset_point_safe(p: &Point3<usize>, v: &Vector3<f32>) -> (Option<Point3<usize>>, Point3<f32>) {
-    let p = Point3::new(p.x as f32, p.y as f32, p.z as f32);
-    let t = p + v;
-
-    if t.x < 0. || t.y < 0. || t.z < 0. {
-        return (None, t);
+    ChunkMesh {
+        indices,
+        positions,
+        normals,
+        uvs,
+        layers,
+        tangents,
     }
-
-    (
-        Some(Point3 {
-            x: t.x as usize,
-            y: t.y as usize,
-            z: t.z as usize,
-        }),
-        t,
-    )
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct ModelVertex {
-    pub position: [f32; 3],
-    pub normal: [f32; 3],
-    pub tex_coords: [f32; 2],
-    pub tangent: [f32; 4],
-}
-
-// 16 x 16 texture atlas
-const ATLAS_STEP: f32 = 0.5;
-// const ATLAS_ADJ: f32 = ATLAS_STEP * ATLAS_STEP;
-const DEFAULT_TEX_COORDS: [[f32; 2]; 4] = [
-    [0.0, 0.0],
-    [1.0 / 16.0, 0.0],
-    [1.0 / 16.0, 1.0 / 16.0],
-    [0.0, 1.0 / 16.0],
-];
-
-// impl Block {
-//     pub fn get_atlas_uv(&self, face: &Face, above: Option<Block>) -> (u8, u8) {
-//         match self {
-//             Block::Grass => match face {
-//                 Face::Top => (0, 0),
-//                 Face::Bottom => (2, 0),
-//                 _ => {
-//                     if let Some(Block::GRASS) = above {
-//                         (2, 0)
-//                     } else {
-//                         (3, 0)
-//                     }
-//                 }
-//             },
-//             Block::STONE => (0, 1),
-//             _ => panic!("No texture available for {self}"),
-//         }
-//     }
-// }
-
-#[derive(Debug)]
-pub enum Face {
-    Front,
-    Back,
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
-#[derive(Debug)]
-pub struct BlockFace {
-    pub face: Face,
-    pub vertices: [[f32; 3]; 4],
-    pub normal: [f32; 3],
-    // pub tex_coords: [[f32; 2]; 4],
-}
-
-pub const FRONT_FACE: BlockFace = BlockFace {
-    face: Face::Front,
-    vertices: [
-        [0.0, 0.0, 1.0],
-        [0.0, 1.0, 1.0],
-        [1.0, 1.0, 1.0],
-        [1.0, 0.0, 1.0],
-    ],
-    normal: [0.0, 0.0, 1.0],
-    // tex_coords: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
-};
-
-pub const BACK_FACE: BlockFace = BlockFace {
-    face: Face::Back,
-    vertices: [
-        [1.0, 0.0, 0.0],
-        [1.0, 1.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0],
-    ],
-    normal: [0.0, 0.0, -1.0],
-    // tex_coords: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
-};
-
-pub const LEFT_FACE: BlockFace = BlockFace {
-    face: Face::Left,
-    vertices: [
-        [0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 1.0, 1.0],
-        [0.0, 0.0, 1.0],
-    ],
-    normal: [-1.0, 0.0, 0.0],
-    // tex_coords: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
-};
-
-pub const RIGHT_FACE: BlockFace = BlockFace {
-    face: Face::Right,
-    vertices: [
-        [1.0, 0.0, 1.0],
-        [1.0, 1.0, 1.0],
-        [1.0, 1.0, 0.0],
-        [1.0, 0.0, 0.0],
-    ],
-    normal: [1.0, 0.0, 0.0],
-    // tex_coords: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
-};
-
-pub const TOP_FACE: BlockFace = BlockFace {
-    face: Face::Top,
-    vertices: [
-        [0.0, 1.0, 1.0],
-        [0.0, 1.0, 0.0],
-        [1.0, 1.0, 0.0],
-        [1.0, 1.0, 1.0],
-    ],
-    normal: [0.0, 1.0, 0.0],
-    // tex_coords: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
-};
-
-pub const BOTTOM_FACE: BlockFace = BlockFace {
-    face: Face::Bottom,
-    vertices: [
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [1.0, 0.0, 1.0],
-        [1.0, 0.0, 0.0],
-    ],
-    normal: [0.0, -1.0, 0.0],
-    // tex_coords: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
-};
-
-pub const ALL_FACES: [BlockFace; 6] = [
-    FRONT_FACE,
-    BACK_FACE,
-    LEFT_FACE,
-    RIGHT_FACE,
-    TOP_FACE,
-    BOTTOM_FACE,
-];
-
-pub fn generate_face(
-    face: &BlockFace,
-    vertices: &mut Vec<ModelVertex>,
-    indices: &mut Vec<i32>,
-    offset: Point3<usize>,
-    texture: (u8, u8),
-) {
-    let start_index = vertices.len() as i32;
-    let Point3 { x, y, z } = offset;
-    let new_indices = [
-        start_index,
-        start_index + 1,
-        start_index + 2,
-        start_index,
-        start_index + 2,
-        start_index + 3,
-    ];
-
-    let tex_coords = get_tex_coords_from_atlas(texture.0, texture.1);
-    let mut face_positions = [[0.0; 3]; 4];
-    let mut face_uvs = [[0.0; 2]; 4];
-
-    for i in 0..4 {
-        face_positions[i] = [
-            face.vertices[i][0] + x as f32,
-            face.vertices[i][1] + y as f32,
-            face.vertices[i][2] + z as f32,
-        ];
-        face_uvs[i] = tex_coords[i];
-    }
-
-    let tangent = calculate_tangent(&face_positions, &face_uvs, face.normal);
-
-    let new_vertices: Vec<ModelVertex> = (0..4)
-        .map(|i| ModelVertex {
-            position: face_positions[i],
-            normal: face.normal,
-            tex_coords: face_uvs[i],
-            tangent,
-        })
-        .collect();
-
-    vertices.extend_from_slice(&new_vertices);
-    indices.extend_from_slice(&new_indices);
-}
-
-fn calculate_tangent(pos: &[[f32; 3]; 4], uv: &[[f32; 2]; 4], normal: [f32; 3]) -> [f32; 4] {
-    let (p0, p1, p2) = (pos[0], pos[1], pos[2]);
-    let (uv0, uv1, uv2) = (uv[0], uv[1], uv[2]);
-
-    let edge1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-    let edge2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-
-    let delta_uv1 = [uv1[0] - uv0[0], uv1[1] - uv0[1]];
-    let delta_uv2 = [uv2[0] - uv0[0], uv2[1] - uv0[1]];
-
-    let r = 1.0 / (delta_uv1[0] * delta_uv2[1] - delta_uv1[1] * delta_uv2[0]);
-    let tangent = [
-        r * (edge1[0] * delta_uv2[1] - edge2[0] * delta_uv1[1]),
-        r * (edge1[1] * delta_uv2[1] - edge2[1] * delta_uv1[1]),
-        r * (edge1[2] * delta_uv2[1] - edge2[2] * delta_uv1[1]),
-    ];
-
-    // Orthogonalize tangent against normal and normalize
-    let dot = tangent[0] * normal[0] + tangent[1] * normal[1] + tangent[2] * normal[2];
-    let tangent = [
-        tangent[0] - normal[0] * dot,
-        tangent[1] - normal[1] * dot,
-        tangent[2] - normal[2] * dot,
-    ];
-    let len = (tangent[0] * tangent[0] + tangent[1] * tangent[1] + tangent[2] * tangent[2]).sqrt();
-    let tangent = [tangent[0] / len, tangent[1] / len, tangent[2] / len];
-
-    [tangent[0], tangent[1], tangent[2], 1.0] // Assume right-handed bitangent
-}
-
-fn get_tex_coords_from_atlas(x: u8, y: u8) -> [[f32; 2]; 4] {
-    let (xmin, ymin) = (ATLAS_STEP * x as f32, ATLAS_STEP * y as f32);
-    let (xmax, ymax) = (xmin + ATLAS_STEP, ymin + ATLAS_STEP);
-    let (xmin, ymin) = (xmin, ymin);
-    let (xmax, ymax) = (xmax, ymax);
-
-    return [[xmin, ymax], [xmax, ymax], [xmax, ymin], [xmin, ymin]];
 }
