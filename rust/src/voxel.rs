@@ -1,5 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 
 use block_mesh::{
@@ -10,14 +11,15 @@ use block_mesh::{
 };
 use crossbeam::queue::{ArrayQueue, SegQueue};
 use dashmap::DashMap;
-use glam::IVec3;
+use glam::{IVec3, Vec3};
 use godot::global::godot_print;
+use noise::{HybridMulti, Perlin};
 use rayon::{
     ThreadPool, ThreadPoolBuilder,
     iter::{IntoParallelRefIterator, ParallelIterator},
 };
 
-use crate::terrain::generate_chunk;
+use crate::terrain::{generate_chunk, generate_chunk_noise};
 
 pub const CHUNK_SIZE_I: i32 = 32;
 pub const CHUNK_VOLUME: usize = (CHUNK_SIZE_I * CHUNK_SIZE_I * CHUNK_SIZE_I) as usize;
@@ -28,17 +30,23 @@ pub const CHUNK_SIZE_U_PADDED: u32 = CHUNK_SIZE_I_PADDED as u32;
 //     ConstShape3u32<CHUNK_SIZE_U_PADDED, CHUNK_SIZE_U_PADDED, CHUNK_SIZE_U_PADDED>;
 
 pub struct VoxelWorld {
-    chunks: Arc<DashMap<IVec3, Chunk32>>,
+    chunks: Arc<DashMap<IVec3, Chunk34>>,
     pub render_queue: Arc<DashMap<IVec3, ChunkMesh>>,
     mesh_thread_pool: Arc<ThreadPool>,
     radius_h: usize,
     radius_v: usize,
     mesh_queue: ArrayQueue<IVec3>,
     meshing_queue: Arc<SegQueue<IVec3>>,
+    noise: Arc<HybridMulti<Perlin>>,
 }
 
 impl VoxelWorld {
     pub fn new(radius_h: usize, radius_v: usize) -> Self {
+        let mut noise = HybridMulti::<Perlin>::new(1234);
+        noise.octaves = 5;
+        noise.frequency = 1.1;
+        noise.lacunarity = 2.8;
+        noise.persistence = 0.4;
         Self {
             chunks: Arc::new(DashMap::new()),
             render_queue: Arc::new(DashMap::new()),
@@ -47,13 +55,14 @@ impl VoxelWorld {
             radius_v,
             mesh_queue: ArrayQueue::new(2 * radius_h * 2 * radius_h * 2 * radius_v),
             meshing_queue: Arc::new(SegQueue::new()),
+            noise: Arc::new(noise),
         }
     }
 
     pub fn add_change(&mut self, wv: &IVec3, new_block: Block) -> Block {
-        let chunk_v = wv_to_chunk_v(wv);
+        let chunk_v = wv_to_cv(wv);
         if !self.chunks.contains_key(&chunk_v) {
-            self.chunks.insert(chunk_v, Chunk32::empty());
+            self.chunks.insert(chunk_v, Chunk34::empty());
         }
 
         let mut chunk = self.chunks.get_mut(&chunk_v).unwrap();
@@ -74,7 +83,7 @@ impl VoxelWorld {
     pub fn remove_generated(&mut self) {
         self.render_queue.clear();
         self.chunks.alter_all(|_, mut chunk| {
-            chunk.voxels = Chunk32::empty().voxels;
+            chunk.voxels = Chunk34::empty().voxels;
             chunk.generated = false;
             if chunk.changes.len() > 0 {
                 chunk.pipeline = Pipeline::NeedsFastMesh;
@@ -84,8 +93,54 @@ impl VoxelWorld {
         });
     }
 
-    pub fn queue_chunks_to_mesh(&mut self, camera_pos: &IVec3) {
-        let camera_chunk_v = wv_to_chunk_v(camera_pos);
+    // pub fn queue_chunks_to_mesh(&mut self, camera_pos: &Vec3, camera_dir: &Vec3) {
+    //     let camera_pos_i = camera_pos.as_ivec3();
+    //     let camera_chunk_v = wv_to_chunk_v(&camera_pos_i);
+    //     let camera_dir = camera_dir.normalize();
+
+    //     let radius_h = self.radius_h as i32;
+    //     let radius_v = self.radius_v as i32;
+
+    //     let mut chunk_vs = Vec::with_capacity(self.radius_h * self.radius_h * self.radius_v);
+
+    //     for x in -radius_h..radius_h {
+    //         for y in -radius_v..radius_v {
+    //             for z in -radius_h..radius_h {
+    //                 let wv = IVec3 {
+    //                     x: camera_pos_i.x + (x * CHUNK_SIZE_I),
+    //                     y: camera_pos_i.y + (y * CHUNK_SIZE_I),
+    //                     z: camera_pos_i.z + (z * CHUNK_SIZE_I),
+    //                 };
+
+    //                 let chunk_v = wv_to_chunk_v(&wv);
+    //                 chunk_vs.push(chunk_v);
+    //             }
+    //         }
+    //     }
+
+    //     chunk_vs.sort_by(|a, b| {
+    //         let a_center = Vec3::from((*a * CHUNK_SIZE_I).as_vec3());
+    //         let b_center = Vec3::from((*b * CHUNK_SIZE_I).as_vec3());
+
+    //         let a_vec = a_center - *camera_pos;
+    //         let b_vec = b_center - *camera_pos;
+
+    //         let a_score = a_vec.length_squared() - camera_dir.dot(a_vec.normalize()) * 10000.0;
+    //         let b_score = b_vec.length_squared() - camera_dir.dot(b_vec.normalize()) * 10000.0;
+
+    //         a_score
+    //             .partial_cmp(&b_score)
+    //             .unwrap_or(std::cmp::Ordering::Equal)
+    //     });
+
+    //     for chunk in chunk_vs {
+    //         self.mesh_queue.force_push(chunk);
+    //     }
+    // }
+
+    pub fn queue_chunks_to_mesh(&mut self, camera_pos: &Vec3, camera_dir: &Vec3) {
+        let camera_pos_i = camera_pos.as_ivec3();
+        let camera_chunk_v = wv_to_cv(&camera_pos_i);
 
         let radius_h = self.radius_h as i32;
         let radius_v = self.radius_v as i32;
@@ -96,26 +151,13 @@ impl VoxelWorld {
             for y in -radius_v..radius_v {
                 for z in -radius_h..radius_h {
                     let wv = IVec3 {
-                        x: camera_pos.x + (x * CHUNK_SIZE_I),
-                        y: camera_pos.y + (y * CHUNK_SIZE_I),
-                        z: camera_pos.z + (z * CHUNK_SIZE_I),
+                        x: camera_pos_i.x + (x * CHUNK_SIZE_I),
+                        y: camera_pos_i.y + (y * CHUNK_SIZE_I),
+                        z: camera_pos_i.z + (z * CHUNK_SIZE_I),
                     };
 
-                    let chunk_v = wv_to_chunk_v(&wv);
+                    let chunk_v = wv_to_cv(&wv);
                     chunk_vs.push(chunk_v);
-                    // let contains_key = self.chunks.contains_key(&chunk_v);
-                    // if !contains_key {
-                    //     let mut new_chunk = Chunk32::empty();
-                    //     new_chunk.pipeline = Pipeline::NeedsFastMesh;
-
-                    //     self.chunks.insert(chunk_v, new_chunk);
-                    // }
-
-                    // if contains_key && self.chunks.get(&chunk_v).unwrap().pipeline == Pipeline::None
-                    // {
-                    //     let mut chunk = self.chunks.get_mut(&chunk_v).unwrap();
-                    //     chunk.pipeline = Pipeline::NeedsFastMesh
-                    // }
                 }
             }
         }
@@ -129,39 +171,6 @@ impl VoxelWorld {
     pub fn mesh_queued_chunks(&mut self, camera_pos: &IVec3, procedural: bool) {
         let t1 = std::time::Instant::now();
 
-        // let mut chunks_to_mesh: Vec<_> = self
-        //     .chunks
-        //     .iter()
-        //     .filter_map(|entry| {
-        //         matches!(entry.pipeline, Pipeline::NeedsFastMesh).then_some(entry.key().clone())
-        //     })
-        //     .collect();
-
-        // chunks_to_mesh.sort_by_key(|cp| (cp * CHUNK_SIZE_I - camera_pos).length_squared());
-
-        // if chunks_to_mesh.len() > 0 {
-        //     godot_print!(
-        //         "[VoxelWorld] (mesh_queued_chunks) - t={:?} len={}",
-        //         t1.elapsed(),
-        //         chunks_to_mesh.len()
-        //     );
-        // }
-
-        // let chunk_to_mesh = chunks_to_mesh.get(0);
-        // if chunk_to_mesh.is_none() {
-        //     return;
-        // }
-        // let chunk_to_mesh = chunk_to_mesh.unwrap().clone();
-        // let mut chunk = self.chunks.get_mut(&chunk_to_mesh).unwrap();
-        // chunk.pipeline = Pipeline::Meshing;
-
-        // drop(chunk);
-
-        // let meshing_count = self
-        //     .chunks
-        //     .iter()
-        //     .filter(|entry| matches!(entry.pipeline, Pipeline::Meshing))
-        //     .count();
         let meshing_count = self.meshing_queue.len();
 
         let available_tasks = self
@@ -175,12 +184,12 @@ impl VoxelWorld {
 
         let mut chunks_to_mesh = vec![];
         for _ in 0..self.mesh_queue.len() {
-            if chunks_to_mesh.len() >= available_tasks * 2 {
+            if chunks_to_mesh.len() >= available_tasks {
                 break;
             }
             if let Some(chunk_v) = self.mesh_queue.pop() {
                 if !self.chunks.contains_key(&chunk_v) {
-                    let mut new_chunk = Chunk32::empty();
+                    let mut new_chunk = Chunk34::empty();
                     new_chunk.pipeline = Pipeline::NeedsFastMesh;
                     self.chunks.insert(chunk_v, new_chunk);
                 }
@@ -191,52 +200,119 @@ impl VoxelWorld {
             }
         }
 
-        if chunks_to_mesh.len() > 0 {
-            // godot_print!(
-            //     "Available tasks: {available_tasks} meshing_count: {meshing_count} threads: {} meshing_queue.len: {} chunks_to_mesh: {:?}",
-            //     self.mesh_thread_pool.current_num_threads(),
-            //     self.mesh_queue.len(),
-            //     chunks_to_mesh
-            // );
-        }
-
-        let camera_chunk_v = wv_to_chunk_v(camera_pos);
         for chunk_v in &chunks_to_mesh {
             let mut chunk = self.chunks.get_mut(chunk_v).unwrap();
             chunk.pipeline = Pipeline::Meshing;
             self.meshing_queue.push(*chunk_v);
         }
 
+        // if chunks_to_mesh.len() == 0 {
+        //     godot_print!("Nothing to mesh");
+        // }
+
         let render_queue = self.render_queue.clone();
         let chunks = self.chunks.clone();
         let pool = self.mesh_thread_pool.clone();
         let meshing_queue = self.meshing_queue.clone();
+        let noise = self.noise.clone();
 
         godot::task::spawn(async move {
             for chunk_v in chunks_to_mesh {
+                let t1 = std::time::Instant::now();
                 let chunks = chunks.clone();
                 let render_queue = render_queue.clone();
                 let meshing_queue = meshing_queue.clone();
+                let noise = noise.clone();
+
                 pool.spawn(move || {
+                    let mut logs = vec![];
+
+                    let clone_time_1 = std::time::Instant::now();
+
                     let chunk = chunks.get(&chunk_v).unwrap();
                     let mut working_chunk = chunk.clone();
+
+                    logs.push(format!(
+                        "[thread] (clonetime_1) - t={:?}",
+                        clone_time_1.elapsed()
+                    ));
+
                     drop(chunk);
 
                     if procedural && !working_chunk.generated {
-                        let chunk_wv = chunk_v_to_wv(&chunk_v);
-                        generate_chunk(
+                        let gen_time = std::time::Instant::now();
+
+                        let chunk_wv = cv_to_wv(&chunk_v);
+                        let mut noise_buffer = vec![f64::NAN; Chunk34ShapeI::SIZE as usize];
+                        generate_chunk_noise(
                             &chunk_wv,
-                            1234,
-                            working_chunk.shape(),
-                            &mut working_chunk.voxels,
+                            &working_chunk.shape_i(),
+                            8,
+                            1000.0,
+                            &noise,
+                            &mut noise_buffer,
                         );
+
+                        let terrain_det = std::time::Instant::now();
+
+                        for z in 0..CHUNK_SIZE_I {
+                            for y in 0..CHUNK_SIZE_I {
+                                for x in 0..CHUNK_SIZE_I {
+                                    let lv = IVec3::new(x, y, z);
+                                    let wv = chunk_wv + lv;
+                                    let idx = working_chunk.linearize_lv(&lv);
+                                    let noise_value = noise_buffer[idx] * 100.0;
+
+                                    if wv.y < -20 {
+                                        working_chunk.voxels[idx] = Block::Dirt;
+                                        continue;
+                                    }
+
+                                    // If y is less than the noise sample, we will set the voxel to solid
+                                    if (wv.y as f64) < noise_value {
+                                        if wv.y >= 120 {
+                                            working_chunk.voxels[idx] = Block::Snow;
+                                        } else if wv.y >= 60 {
+                                            working_chunk.voxels[idx] = Block::Stone;
+                                        } else {
+                                            working_chunk.voxels[idx] = Block::Grass;
+                                        }
+                                    } else {
+                                        working_chunk.voxels[idx] = Block::None;
+                                    }
+                                }
+                            }
+                        }
+
                         working_chunk.generated = true;
+
+                        logs.push(format!(
+                            "[thread] (terrain_det) - t={:?}",
+                            terrain_det.elapsed()
+                        ));
+                        logs.push(format!("[thread] (gen_time) - t={:?}", gen_time.elapsed()));
                     }
+
+                    working_chunk.merge_changes();
+
+                    let clone_time_2 = std::time::Instant::now();
 
                     let chunk = working_chunk.clone();
                     chunks.insert(chunk_v, chunk);
 
-                    let merged_voxels = working_chunk.merge_changes();
+                    logs.push(format!(
+                        "[thread] (clone_time_2) - t={:?}",
+                        clone_time_2.elapsed()
+                    ));
+
+                    let merge_time = std::time::Instant::now();
+
+                    // let merged_voxels = working_chunk.merge_changes();
+
+                    logs.push(format!(
+                        "[thread] (merge_time) - t={:?}",
+                        merge_time.elapsed()
+                    ));
                     // let mut buffer = UnitQuadBuffer::new();
                     // visible_block_faces(
                     //     &merged_voxels.voxels,
@@ -247,15 +323,23 @@ impl VoxelWorld {
                     //     &mut buffer,
                     // );
 
+                    let greedy_time = std::time::Instant::now();
                     let mut buffer = GreedyQuadsBuffer::new(CHUNK_VOLUME * 6);
                     greedy_quads(
-                        &merged_voxels.voxels,
-                        &merged_voxels.shape(),
+                        &working_chunk.voxels,
+                        &working_chunk.shape_u(),
                         [0; 3],
                         [33; 3],
                         &RIGHT_HANDED_Y_UP_CONFIG.faces,
                         &mut buffer,
                     );
+
+                    logs.push(format!(
+                        "[thread] (greedy_time) - t={:?}",
+                        greedy_time.elapsed()
+                    ));
+
+                    let mesh_time = Instant::now();
 
                     let mesh = if buffer.quads.num_quads() == 0 {
                         ChunkMesh {
@@ -275,22 +359,29 @@ impl VoxelWorld {
 
                         build_mesh_from_quads(
                             buffer.quads,
-                            &merged_voxels,
+                            &working_chunk,
                             &RIGHT_HANDED_Y_UP_CONFIG,
                             &chunk_offset,
                         )
                     };
 
+                    logs.push(format!(
+                        "[thread] (mesh_time) - t={:?}",
+                        mesh_time.elapsed()
+                    ));
+
                     render_queue.insert(chunk_v, mesh);
                     meshing_queue.pop();
 
-                    // let mut file = OpenOptions::new()
-                    //     .create(true)
-                    //     .append(true)
-                    //     .open("log.txt")
-                    //     .unwrap();
+                    if false {
+                        let mut file = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("log.txt")
+                            .unwrap();
 
-                    // writeln!(file, "thread t={:?}", t1.elapsed()).unwrap();
+                        writeln!(file, "{}", logs.join("\n")).unwrap();
+                    }
                 })
             }
         });
@@ -357,20 +448,93 @@ pub enum Pipeline {
     Rendered,
 }
 
-pub type Chunk32Shape = ConstShape3i32<32, 32, 32>;
+// pub type Chunk32Shape = ConstShape3i32<32, 32, 32>;
+
+// #[derive(Clone)]
+// pub struct Chunk32 {
+//     voxels: [Block; 32 * 32 * 32],
+//     changes: HashMap<IVec3, Block>,
+//     generated: bool,
+//     pipeline: Pipeline,
+// }
+
+// impl Chunk32 {
+//     fn empty() -> Self {
+//         Self {
+//             voxels: [Block::None; 32 * 32 * 32],
+//             changes: HashMap::new(),
+//             generated: false,
+//             pipeline: Pipeline::None,
+//         }
+//     }
+
+//     pub fn add_change(&mut self, wv: &IVec3, new_block: Block) -> Block {
+//         let voxel_v = wv_to_voxel_v(wv);
+//         let old_block = self.changes.insert(voxel_v, new_block).unwrap_or_else(|| {
+//             let idx = self.linearize(&voxel_v);
+//             godot_print!(
+//                 "[VoxelWorld2] (add_change) - wv: {wv} => voxel_v: {voxel_v} => idx: {idx}"
+//             );
+//             self.voxels[idx]
+//         });
+
+//         self.pipeline = Pipeline::NeedsFastMesh;
+
+//         old_block
+//     }
+
+//     fn linearize(&self, voxel_v: &IVec3) -> usize {
+//         Chunk32Shape::linearize(voxel_v.to_array()) as usize
+//     }
+
+//     pub fn merge_changes(self) -> Chunk34 {
+//         let mut voxels = [Block::None; 34 * 34 * 34];
+
+//         let size = 32;
+//         for z in 0..size {
+//             for y in 0..size {
+//                 for x in 0..size {
+//                     let voxel_v = IVec3::new(x, y, z);
+//                     let idx = self.linearize(&voxel_v);
+//                     let block = self
+//                         .changes
+//                         .get(&voxel_v)
+//                         .unwrap_or_else(|| &self.voxels[idx]);
+
+//                     // Offset by 1 to account for padding
+//                     let dst_x = (x + 1) as u32;
+//                     let dst_y = (y + 1) as u32;
+//                     let dst_z = (z + 1) as u32;
+//                     let dst_idx = Chunk34Shape::linearize([dst_x, dst_y, dst_z]) as usize;
+
+//                     voxels[dst_idx] = *block;
+//                 }
+//             }
+//         }
+
+//         Chunk34 { voxels }
+//     }
+
+//     pub fn shape(&self) -> Chunk32Shape {
+//         Chunk32Shape {}
+//     }
+// }
+
+pub type Chunk34ShapeI = ConstShape3i32<34, 34, 34>;
+pub type Chunk34ShapeU = ConstShape3u32<34, 34, 34>;
 
 #[derive(Clone)]
-pub struct Chunk32 {
-    voxels: [Block; 32 * 32 * 32],
+pub struct Chunk34 {
+    voxels: [Block; 34 * 34 * 34],
     changes: HashMap<IVec3, Block>,
     generated: bool,
     pipeline: Pipeline,
 }
 
-impl Chunk32 {
+impl Chunk34 {
     fn empty() -> Self {
         Self {
-            voxels: [Block::None; 32 * 32 * 32],
+            voxels: [Block::None; 34 * 34 * 34],
             changes: HashMap::new(),
             generated: false,
             pipeline: Pipeline::None,
@@ -378,9 +542,9 @@ impl Chunk32 {
     }
 
     pub fn add_change(&mut self, wv: &IVec3, new_block: Block) -> Block {
-        let voxel_v = wv_to_voxel_v(wv);
+        let voxel_v = wv_to_lv(wv);
         let old_block = self.changes.insert(voxel_v, new_block).unwrap_or_else(|| {
-            let idx = self.linearize(&voxel_v);
+            let idx = self.linearize_lv(&voxel_v);
             godot_print!(
                 "[VoxelWorld2] (add_change) - wv: {wv} => voxel_v: {voxel_v} => idx: {idx}"
             );
@@ -392,67 +556,39 @@ impl Chunk32 {
         old_block
     }
 
-    fn linearize(&self, voxel_v: &IVec3) -> usize {
-        Chunk32Shape::linearize(voxel_v.to_array()) as usize
-    }
-
-    pub fn merge_changes(self) -> Chunk34 {
-        let mut voxels = [Block::None; 34 * 34 * 34];
-
-        let size = 32;
-        for z in 0..size {
-            for y in 0..size {
-                for x in 0..size {
-                    let voxel_v = IVec3::new(x, y, z);
-                    let idx = self.linearize(&voxel_v);
-                    let block = self
-                        .changes
-                        .get(&voxel_v)
-                        .unwrap_or_else(|| &self.voxels[idx]);
-
-                    // Offset by 1 to account for padding
-                    let dst_x = (x + 1) as u32;
-                    let dst_y = (y + 1) as u32;
-                    let dst_z = (z + 1) as u32;
-                    let dst_idx = Chunk34Shape::linearize([dst_x, dst_y, dst_z]) as usize;
-
-                    voxels[dst_idx] = *block;
-                }
-            }
+    pub fn merge_changes(&mut self) {
+        for (wv, block) in &self.changes {
+            let lv = wv_to_lv(&wv);
+            self.voxels[self.linearize_lv(&lv)] = *block;
         }
-
-        Chunk34 { voxels }
     }
 
-    pub fn shape(&self) -> Chunk32Shape {
-        Chunk32Shape {}
+    pub fn linearize_lv(&self, p: &IVec3) -> usize {
+        Chunk34ShapeI::linearize(p.to_array().map(|s| (s + 1) as i32)) as usize
     }
-}
 
-pub type Chunk34Shape = ConstShape3u32<34, 34, 34>;
-pub struct Chunk34 {
-    voxels: [Block; 34 * 34 * 34],
-}
-
-impl Chunk34 {
     pub fn linearize(&self, p: [u32; 3]) -> usize {
-        Chunk34Shape::linearize(p) as usize
+        Chunk34ShapeU::linearize(p) as usize
     }
 
-    pub fn shape(&self) -> Chunk34Shape {
-        Chunk34Shape {}
+    pub fn shape_i(&self) -> Chunk34ShapeI {
+        Chunk34ShapeI {}
+    }
+
+    pub fn shape_u(&self) -> Chunk34ShapeU {
+        Chunk34ShapeU {}
     }
 }
 
-pub fn wv_to_chunk_v(wv: &IVec3) -> IVec3 {
+pub fn wv_to_cv(wv: &IVec3) -> IVec3 {
     wv.div_euclid(IVec3::splat(CHUNK_SIZE_I))
 }
 
-fn chunk_v_to_wv(chunk_v: &IVec3) -> IVec3 {
+fn cv_to_wv(chunk_v: &IVec3) -> IVec3 {
     chunk_v * CHUNK_SIZE_I
 }
 
-fn wv_to_voxel_v(wv: &IVec3) -> IVec3 {
+fn wv_to_lv(wv: &IVec3) -> IVec3 {
     wv.rem_euclid(IVec3::splat(CHUNK_SIZE_I))
 }
 

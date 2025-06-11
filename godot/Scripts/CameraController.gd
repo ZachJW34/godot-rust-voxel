@@ -37,7 +37,7 @@ func _unhandled_input(event):
 func _physics_process(delta: float) -> void:
 	#var frustum = camera.get_frustum();
 	
-	voxel_world.queue_chunks_to_mesh(position)
+	voxel_world.queue_chunks_to_mesh(position, -transform.basis.z)
 		
 	var direction = Vector3.ZERO
 

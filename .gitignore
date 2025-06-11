@@ -31,3 +31,6 @@ rust/Cargo.lock  # (optional, see note below)
 **/node_modules/
 **/dist/
 **/build/
+
+# logs
+log.*

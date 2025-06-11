@@ -35,37 +35,25 @@ func _ready() -> void:
 		var viewport = EditorInterface.get_editor_viewport_3d()
 		var editor_camera = viewport.get_camera_3d();
 		var pos = editor_camera.position;
-		print(pos)
-		#var cube = MeshInstance3D.new()
-		#cube.mesh = BoxMesh.new()  # Creates a 1x1x1 cube centered at origin
-		#cube.position = Vector3(32,0,0) # Move it to (5, 0, 0)
-		#add_child(cube)
 		
 		for x in range(0, 31):
 			var block = (abs(x) %3)  + 1;
-			print(block);
 			add_block(Vector3(x, 0, 0), block)
 			add_block(Vector3(0, x, 0), block)
 			add_block(Vector3(0, 0, x), block)
-			
-		render()
+		
 			
 	add_child(voxels)
 	
 func _physics_process(_time) -> void:
-	if !Engine.is_editor_hint():
-		voxels.render()
+	voxels.render()
 		
-func add_block(pos: Vector3, block: int):
-	voxels.add_block(vector_to_vector_i(pos), block)
+func add_block(camera_pos: Vector3, block: int):
+	voxels.add_block(camera_pos, block)
 	
-func queue_chunks_to_mesh(pos: Vector3):
-	voxels.queue_chunks_to_mesh(vector_to_vector_i(pos))
+func queue_chunks_to_mesh(camera_pos: Vector3, camera_dir: Vector3):
+	voxels.queue_chunks_to_mesh(camera_pos, camera_dir)
 	
 func render() -> void:
 	voxels.render()
 	
-func vector_to_vector_i(pos: Vector3):
-	var floored = pos.floor()
-	var vec3i = Vector3i(floored)
-	return vec3i

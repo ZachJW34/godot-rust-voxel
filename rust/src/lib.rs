@@ -1,11 +1,11 @@
-use glam::IVec3;
+use glam::{IVec3, Vec3};
 use godot::classes::mesh::{ArrayFormat, PrimitiveType};
 use godot::classes::{
     ArrayMesh, CompressedTexture2DArray, MeshInstance3D, ResourceLoader, Shader, ShaderMaterial,
 };
 use godot::obj::{EngineBitfield, WithBaseField};
 use godot::prelude::*;
-use voxel::{Block, VoxelWorld, wv_to_chunk_v};
+use voxel::{Block, VoxelWorld, wv_to_cv};
 
 mod terrain;
 mod voxel;
@@ -29,7 +29,7 @@ pub struct Voxels {
     // texture_array: Gd<CompressedTexture2DArray>,
     main_shader_material: Gd<ShaderMaterial>,
     wireframe_shader_material: Gd<ShaderMaterial>,
-    camera_pos: IVec3,
+    camera_pos: Vec3,
 }
 
 const ARRAY_VERTEX: usize = 0;
@@ -75,12 +75,12 @@ impl INode3D for Voxels {
 
         Self {
             base,
-            world: VoxelWorld::new(100, 4),
+            world: VoxelWorld::new(10, 4),
             wireframe: false,
             procedural: true,
             wireframe_shader_material,
             main_shader_material,
-            camera_pos: IVec3::MAX,
+            camera_pos: Vec3::MAX,
         }
     }
 
@@ -93,6 +93,26 @@ impl INode3D for Voxels {
     // }
 }
 
+trait ToGlamVec3 {
+    fn as_vec3(&self) -> Vec3;
+}
+
+trait ToGlamIVec3 {
+    fn as_ivec3(&self) -> IVec3;
+}
+
+impl ToGlamVec3 for Vector3 {
+    fn as_vec3(&self) -> Vec3 {
+        Vec3::from_array(self.to_array())
+    }
+}
+
+impl ToGlamIVec3 for Vector3 {
+    fn as_ivec3(&self) -> IVec3 {
+        self.as_vec3().as_ivec3()
+    }
+}
+
 #[godot_api]
 impl Voxels {
     // #[func]
@@ -101,9 +121,9 @@ impl Voxels {
     // }
 
     #[func]
-    fn add_block(&mut self, point: Vector3i, block: i32) {
-        self.world
-            .add_change(&IVec3::new(point.x, point.y, point.z), Block::from(block));
+    fn add_block(&mut self, point: Vector3, block: i32) {
+        let point = point.as_ivec3();
+        self.world.add_change(&point, Block::from(block));
     }
 
     #[func]
@@ -119,19 +139,21 @@ impl Voxels {
     }
 
     #[func]
-    fn queue_chunks_to_mesh(&mut self, camera_pos: Vector3i) {
-        let camera_pos = IVec3::new(camera_pos.x, camera_pos.y, camera_pos.z);
-        let chunk_key_new = wv_to_chunk_v(&camera_pos);
-        let chunk_key_old = wv_to_chunk_v(&self.camera_pos);
+    fn queue_chunks_to_mesh(&mut self, camera_pos: Vector3, camera_dir: Vector3) {
+        let camera_pos = camera_pos.as_vec3();
+        let camera_pos_i = camera_pos.as_ivec3();
+        let camera_dir = camera_dir.as_vec3();
 
-        self.camera_pos = camera_pos;
+        let chunk_key_old = wv_to_cv(&self.camera_pos.as_ivec3());
+        let chunk_key_new = wv_to_cv(&camera_pos_i);
 
         // Only search for new meshes on chunk change
         if chunk_key_new == chunk_key_old {
             return;
         }
 
-        self.world.queue_chunks_to_mesh(&camera_pos);
+        self.camera_pos = camera_pos;
+        self.world.queue_chunks_to_mesh(&camera_pos, &camera_dir);
     }
 
     fn remove_all_nodes(&mut self) {
@@ -145,7 +167,7 @@ impl Voxels {
     fn render(&mut self) {
         // let t1 = std::time::Instant::now();
         self.world
-            .mesh_queued_chunks(&self.camera_pos, self.procedural);
+            .mesh_queued_chunks(&self.camera_pos.as_ivec3(), self.procedural);
 
         let shader_material = if self.wireframe {
             // Is clone an issue here?
@@ -154,12 +176,19 @@ impl Voxels {
             &self.main_shader_material.clone()
         };
 
-        let chunks_to_render: Vec<_> = self
+        let mut chunks_to_render: Vec<_> = self
             .world
             .render_queue
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
+
+        // if chunks_to_render.len() == 0 {
+        //     godot_print!("No chunks to render")
+        // }
+
+        let camera_chunk_v = wv_to_cv(&self.camera_pos.as_ivec3());
+        chunks_to_render.sort_by_key(|chunk_v| (camera_chunk_v - chunk_v).length_squared());
 
         for chunk_v in chunks_to_render {
             let (_, chunk_mesh) = self.world.render_queue.remove(&chunk_v).unwrap();
