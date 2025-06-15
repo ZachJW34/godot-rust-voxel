@@ -529,6 +529,7 @@ dependencies = [
  "log",
  "mikktspace",
  "noise",
+ "once_cell",
  "rayon",
 ]
 

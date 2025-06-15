@@ -41,12 +41,13 @@ func _ready() -> void:
 			add_block(Vector3(x, 0, 0), block)
 			add_block(Vector3(0, x, 0), block)
 			add_block(Vector3(0, 0, x), block)
-		
+		render()
 			
 	add_child(voxels)
 	
-func _physics_process(_time) -> void:
-	voxels.render()
+func _process(_time) -> void:
+	if !Engine.is_editor_hint():
+		voxels.render()
 		
 func add_block(camera_pos: Vector3, block: int):
 	voxels.add_block(camera_pos, block)

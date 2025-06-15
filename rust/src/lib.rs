@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use glam::{IVec3, Vec3};
 use godot::classes::mesh::{ArrayFormat, PrimitiveType};
 use godot::classes::{
@@ -30,6 +32,7 @@ pub struct Voxels {
     main_shader_material: Gd<ShaderMaterial>,
     wireframe_shader_material: Gd<ShaderMaterial>,
     camera_pos: Vec3,
+    rendered_chunks: HashMap<IVec3, Gd<Node>>,
 }
 
 const ARRAY_VERTEX: usize = 0;
@@ -75,12 +78,13 @@ impl INode3D for Voxels {
 
         Self {
             base,
-            world: VoxelWorld::new(10, 4),
+            world: VoxelWorld::new(40, 4),
             wireframe: false,
             procedural: true,
             wireframe_shader_material,
             main_shader_material,
             camera_pos: Vec3::MAX,
+            rendered_chunks: HashMap::new(),
         }
     }
 
@@ -165,7 +169,10 @@ impl Voxels {
 
     #[func]
     fn render(&mut self) {
-        // let t1 = std::time::Instant::now();
+        let mut timings = vec![];
+        timings.push("[VoxelPlugin] (render) - timings:".to_string());
+        let t = std::time::Instant::now();
+
         self.world
             .mesh_queued_chunks(&self.camera_pos.as_ivec3(), self.procedural);
 
@@ -183,23 +190,47 @@ impl Voxels {
             .map(|entry| entry.key().clone())
             .collect();
 
-        // if chunks_to_render.len() == 0 {
-        //     godot_print!("No chunks to render")
+        // if chunks_to_render.len() > 0 {
+        //     godot_print!("Rendering {} chunks", chunks_to_render.len());
         // }
 
         let camera_chunk_v = wv_to_cv(&self.camera_pos.as_ivec3());
         chunks_to_render.sort_by_key(|chunk_v| (camera_chunk_v - chunk_v).length_squared());
 
+        timings.push(format!("\tt_setup={:?}", t.elapsed()));
+
+        let format = ArrayFormat::VERTEX
+            | ArrayFormat::NORMAL
+            | ArrayFormat::TANGENT
+            | ArrayFormat::TEX_UV
+            | ArrayFormat::INDEX
+            | ArrayFormat::CUSTOM0
+            | ArrayFormat::from_ord(4 << ArrayFormat::CUSTOM0_SHIFT.ord());
+
+        // let chunks_to_render: Vec<_> = chunks_to_render.iter().take(25).collect();
+
+        if chunks_to_render.len() > 0 {
+            godot_print!("RenderQueue: {}", chunks_to_render.len());
+        }
+
+        timings.push(format!("\tloop_start ({} chunks):", chunks_to_render.len()));
+        let t = std::time::Instant::now();
         for chunk_v in chunks_to_render {
+            let t = std::time::Instant::now();
             let (_, chunk_mesh) = self.world.render_queue.remove(&chunk_v).unwrap();
-            let existing = self.base_mut().find_child(&chunk_v.to_string());
-            if let Some(child) = existing {
+            if self.rendered_chunks.contains_key(&chunk_v) {
+                godot_print!("Removing chunk...");
+                let child = self.rendered_chunks.remove(&chunk_v).unwrap();
                 self.base_mut().remove_child(&child);
                 child.free();
             }
-            if chunk_mesh.positions.len() == 0 {
-                return;
+
+            if chunk_mesh.positions.len() <= 1 {
+                continue;
             }
+
+            timings.push(format!("\t\tcheck_chunk={:?}", t.elapsed()));
+            let t = std::time::Instant::now();
 
             let indices = PackedInt32Array::from_iter(chunk_mesh.indices.iter().map(|i| *i as i32));
             let positions = PackedVector3Array::from_iter(
@@ -208,13 +239,14 @@ impl Voxels {
             let normals = PackedVector3Array::from_iter(
                 chunk_mesh.normals.iter().map(|n| Vector3::from_array(*n)),
             );
-            let tangents = PackedFloat32Array::from_iter(
-                chunk_mesh.tangents.iter().flat_map(|t| t.iter().copied()),
-            );
+            let tangents = PackedFloat32Array::from(chunk_mesh.tangents);
             let uvs = PackedVector2Array::from_iter(
                 chunk_mesh.uvs.iter().map(|uv| Vector2::from_array(*uv)),
             );
-            let layers = PackedFloat32Array::from(chunk_mesh.layers.clone());
+            let layers = PackedFloat32Array::from(chunk_mesh.layers);
+
+            timings.push(format!("\t\tmapping={:?}", t.elapsed()));
+            let t = std::time::Instant::now();
 
             let mut array = VariantArray::new();
             array.resize(ARRAY_MAX, &Variant::nil());
@@ -227,16 +259,11 @@ impl Voxels {
             array.set(ARRAY_CUSTOM0, &layers.to_variant());
 
             let mut mesh = ArrayMesh::new_gd();
-            let format = ArrayFormat::VERTEX
-                | ArrayFormat::NORMAL
-                | ArrayFormat::TANGENT
-                | ArrayFormat::TEX_UV
-                | ArrayFormat::INDEX
-                | ArrayFormat::CUSTOM0
-                | ArrayFormat::from_ord(4 << ArrayFormat::CUSTOM0_SHIFT.ord());
+
             mesh.add_surface_from_arrays_ex(PrimitiveType::TRIANGLES, &array)
                 .flags(format)
                 .done();
+
             mesh.surface_set_material(0, shader_material);
 
             let mut mesh_instance = MeshInstance3D::new_alloc();
@@ -245,8 +272,32 @@ impl Voxels {
 
             self.base_mut().add_child(&mesh_instance);
             mesh_instance.set_owner(&*self.base_mut());
+
+            self.rendered_chunks.insert(chunk_v, mesh_instance.upcast());
+
+            timings.push(format!("\t\tmeshing={:?}", t.elapsed()));
         }
 
-        // godot_print!("[Voxels] (render): t=${:?}", t1.elapsed());
+        let mut nodes_to_remove = vec![];
+
+        for chunk_v in self.rendered_chunks.keys() {
+            let dis = (camera_chunk_v - chunk_v).abs();
+            if dis.x > self.world.radius_h as i32
+                || dis.z > self.world.radius_h as i32
+                || dis.y > self.world.radius_v as i32
+            {
+                nodes_to_remove.push(*chunk_v);
+            }
+        }
+
+        for chunk_v in nodes_to_remove {
+            let node = self.rendered_chunks.remove(&chunk_v).unwrap();
+            self.base_mut().remove_child(&node);
+            node.free();
+            self.world.chunks.remove(&chunk_v);
+        }
+
+        timings.push(format!("\tloop_end={:?}", t.elapsed()));
+        // godot_print!("{}", timings.join("\n"));
     }
 }

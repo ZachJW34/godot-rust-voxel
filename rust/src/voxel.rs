@@ -5,36 +5,29 @@ use std::{collections::HashMap, sync::Arc};
 
 use block_mesh::{
     GreedyQuadsBuffer, MergeVoxel, QuadBuffer, QuadCoordinateConfig, RIGHT_HANDED_Y_UP_CONFIG,
-    UnitQuadBuffer, Voxel, greedy_quads,
+    Voxel, greedy_quads,
     ndshape::{ConstShape, ConstShape3i32, ConstShape3u32},
-    visible_block_faces,
 };
 use crossbeam::queue::{ArrayQueue, SegQueue};
 use dashmap::DashMap;
 use glam::{IVec3, Vec3};
 use godot::global::godot_print;
 use noise::{HybridMulti, Perlin};
-use rayon::{
-    ThreadPool, ThreadPoolBuilder,
-    iter::{IntoParallelRefIterator, ParallelIterator},
-};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
-use crate::terrain::{generate_chunk, generate_chunk_noise};
+use crate::terrain::generate_chunk_noise;
 
 pub const CHUNK_SIZE_I: i32 = 32;
 pub const CHUNK_VOLUME: usize = (CHUNK_SIZE_I * CHUNK_SIZE_I * CHUNK_SIZE_I) as usize;
-pub const CHUNK_SIZE_I_PADDED: i32 = 32 + 2;
-// pub const CHUNK_SIZE_U: u32 = CHUNK_SIZE_I as u32;
+pub const CHUNK_SIZE_I_PADDED: i32 = CHUNK_SIZE_I + 2;
 pub const CHUNK_SIZE_U_PADDED: u32 = CHUNK_SIZE_I_PADDED as u32;
-// pub type ChunkShapeU =
-//     ConstShape3u32<CHUNK_SIZE_U_PADDED, CHUNK_SIZE_U_PADDED, CHUNK_SIZE_U_PADDED>;
 
 pub struct VoxelWorld {
-    chunks: Arc<DashMap<IVec3, Chunk34>>,
+    pub chunks: Arc<DashMap<IVec3, Chunk34>>,
     pub render_queue: Arc<DashMap<IVec3, ChunkMesh>>,
+    pub radius_h: usize,
+    pub radius_v: usize,
     mesh_thread_pool: Arc<ThreadPool>,
-    radius_h: usize,
-    radius_v: usize,
     mesh_queue: ArrayQueue<IVec3>,
     meshing_queue: Arc<SegQueue<IVec3>>,
     noise: Arc<HybridMulti<Perlin>>,
@@ -61,6 +54,7 @@ impl VoxelWorld {
 
     pub fn add_change(&mut self, wv: &IVec3, new_block: Block) -> Block {
         let chunk_v = wv_to_cv(wv);
+        godot_print!("Adding change to chunk_v={chunk_v}");
         if !self.chunks.contains_key(&chunk_v) {
             self.chunks.insert(chunk_v, Chunk34::empty());
         }
@@ -75,7 +69,7 @@ impl VoxelWorld {
     pub fn reset_mesh(&mut self) {
         self.render_queue.clear();
         self.chunks.alter_all(|_, mut chunk| {
-            chunk.pipeline = Pipeline::NeedsFastMesh;
+            chunk.pipeline = Pipeline::NeedsMesh;
             chunk
         });
     }
@@ -86,7 +80,7 @@ impl VoxelWorld {
             chunk.voxels = Chunk34::empty().voxels;
             chunk.generated = false;
             if chunk.changes.len() > 0 {
-                chunk.pipeline = Pipeline::NeedsFastMesh;
+                chunk.pipeline = Pipeline::NeedsMesh;
             }
 
             chunk
@@ -178,23 +172,23 @@ impl VoxelWorld {
             .current_num_threads()
             .saturating_sub(meshing_count);
 
-        if available_tasks == 0 {
-            return;
-        }
+        // if available_tasks == 0 {
+        //     return;
+        // }
 
         let mut chunks_to_mesh = vec![];
         for _ in 0..self.mesh_queue.len() {
-            if chunks_to_mesh.len() >= available_tasks {
-                break;
-            }
+            // if chunks_to_mesh.len() >= 4 * available_tasks {
+            //     break;
+            // }
             if let Some(chunk_v) = self.mesh_queue.pop() {
                 if !self.chunks.contains_key(&chunk_v) {
                     let mut new_chunk = Chunk34::empty();
-                    new_chunk.pipeline = Pipeline::NeedsFastMesh;
+                    new_chunk.pipeline = Pipeline::NeedsMesh;
                     self.chunks.insert(chunk_v, new_chunk);
                 }
 
-                if self.chunks.get(&chunk_v).unwrap().pipeline == Pipeline::NeedsFastMesh {
+                if self.chunks.get(&chunk_v).unwrap().pipeline == Pipeline::NeedsMesh {
                     chunks_to_mesh.push(chunk_v);
                 }
             }
@@ -206,8 +200,8 @@ impl VoxelWorld {
             self.meshing_queue.push(*chunk_v);
         }
 
-        // if chunks_to_mesh.len() == 0 {
-        //     godot_print!("Nothing to mesh");
+        // if chunks_to_mesh.len() > 0 {
+        //     godot_print!("MeshingQueue: {}", chunks_to_mesh.len());
         // }
 
         let render_queue = self.render_queue.clone();
@@ -218,67 +212,72 @@ impl VoxelWorld {
 
         godot::task::spawn(async move {
             for chunk_v in chunks_to_mesh {
-                let t1 = std::time::Instant::now();
                 let chunks = chunks.clone();
                 let render_queue = render_queue.clone();
                 let meshing_queue = meshing_queue.clone();
                 let noise = noise.clone();
 
                 pool.spawn(move || {
+                    let t1 = std::time::Instant::now();
+
                     let mut logs = vec![];
 
                     let clone_time_1 = std::time::Instant::now();
 
-                    let chunk = chunks.get(&chunk_v).unwrap();
-                    let mut working_chunk = chunk.clone();
+                    let mut working_chunk = chunks.get(&chunk_v).unwrap().clone();
 
                     logs.push(format!(
                         "[thread] (clonetime_1) - t={:?}",
                         clone_time_1.elapsed()
                     ));
 
-                    drop(chunk);
-
                     if procedural && !working_chunk.generated {
-                        let gen_time = std::time::Instant::now();
-
+                        working_chunk.solid_count = 0;
                         let chunk_wv = cv_to_wv(&chunk_v);
                         let mut noise_buffer = vec![f64::NAN; Chunk34ShapeI::SIZE as usize];
-                        generate_chunk_noise(
+                        let gen_time = std::time::Instant::now();
+
+                        let gen_log = generate_chunk_noise(
                             &chunk_wv,
                             &working_chunk.shape_i(),
-                            8,
+                            4,
                             1000.0,
                             &noise,
                             &mut noise_buffer,
                         );
 
+                        logs.push(gen_log);
+
                         let terrain_det = std::time::Instant::now();
 
-                        for z in 0..CHUNK_SIZE_I {
-                            for y in 0..CHUNK_SIZE_I {
-                                for x in 0..CHUNK_SIZE_I {
+                        for z in 0..CHUNK_SIZE_I_PADDED {
+                            for y in 0..CHUNK_SIZE_I_PADDED {
+                                for x in 0..CHUNK_SIZE_I_PADDED {
                                     let lv = IVec3::new(x, y, z);
-                                    let wv = chunk_wv + lv;
-                                    let idx = working_chunk.linearize_lv(&lv);
+                                    let wv = chunk_wv + lv - 1; // we are in padded space
+                                    let idx = working_chunk.linearize([
+                                        lv.x as u32,
+                                        lv.y as u32,
+                                        lv.z as u32,
+                                    ]);
                                     let noise_value = noise_buffer[idx] * 100.0;
 
                                     if wv.y < -20 {
-                                        working_chunk.voxels[idx] = Block::Dirt;
+                                        working_chunk.add_block(idx, Block::Dirt);
                                         continue;
                                     }
 
                                     // If y is less than the noise sample, we will set the voxel to solid
                                     if (wv.y as f64) < noise_value {
                                         if wv.y >= 120 {
-                                            working_chunk.voxels[idx] = Block::Snow;
+                                            working_chunk.add_block(idx, Block::Snow);
                                         } else if wv.y >= 60 {
-                                            working_chunk.voxels[idx] = Block::Stone;
+                                            working_chunk.add_block(idx, Block::Stone);
                                         } else {
-                                            working_chunk.voxels[idx] = Block::Grass;
+                                            working_chunk.add_block(idx, Block::Grass);
                                         }
                                     } else {
-                                        working_chunk.voxels[idx] = Block::None;
+                                        // working_chunk.add_block(idx, Block::None);
                                     }
                                 }
                             }
@@ -307,21 +306,15 @@ impl VoxelWorld {
 
                     let merge_time = std::time::Instant::now();
 
-                    // let merged_voxels = working_chunk.merge_changes();
-
                     logs.push(format!(
                         "[thread] (merge_time) - t={:?}",
                         merge_time.elapsed()
                     ));
-                    // let mut buffer = UnitQuadBuffer::new();
-                    // visible_block_faces(
-                    //     &merged_voxels.voxels,
-                    //     &ChunkShapeU {},
-                    //     [0; 3],
-                    //     [33; 3],
-                    //     &RIGHT_HANDED_Y_UP_CONFIG.faces,
-                    //     &mut buffer,
-                    // );
+
+                    if working_chunk.is_empty() {
+                        meshing_queue.pop();
+                        return;
+                    }
 
                     let greedy_time = std::time::Instant::now();
                     let mut buffer = GreedyQuadsBuffer::new(CHUNK_VOLUME * 6);
@@ -329,7 +322,7 @@ impl VoxelWorld {
                         &working_chunk.voxels,
                         &working_chunk.shape_u(),
                         [0; 3],
-                        [33; 3],
+                        [CHUNK_SIZE_U_PADDED - 1; 3],
                         &RIGHT_HANDED_Y_UP_CONFIG.faces,
                         &mut buffer,
                     );
@@ -372,6 +365,8 @@ impl VoxelWorld {
 
                     render_queue.insert(chunk_v, mesh);
                     meshing_queue.pop();
+
+                    logs.push(format!("[thread] (total) - t={:?}", t1.elapsed()));
 
                     if false {
                         let mut file = OpenOptions::new()
@@ -424,6 +419,13 @@ impl Block {
             Block::None => panic!("Can't get layer_idx for None"),
         }
     }
+
+    pub fn solid(&self) -> u32 {
+        match self {
+            Block::None => 0,
+            _ => 1,
+        }
+    }
 }
 
 impl From<i32> for Block {
@@ -442,124 +444,70 @@ impl From<i32> for Block {
 #[derive(Clone, PartialEq)]
 pub enum Pipeline {
     None,
-    NeedsFastMesh,
+    NeedsMesh,
     Meshing,
     Meshed,
     Rendered,
 }
 
-// pub type Chunk32Shape = ConstShape3i32<32, 32, 32>;
-
-// #[derive(Clone)]
-// pub struct Chunk32 {
-//     voxels: [Block; 32 * 32 * 32],
-//     changes: HashMap<IVec3, Block>,
-//     generated: bool,
-//     pipeline: Pipeline,
-// }
-
-// impl Chunk32 {
-//     fn empty() -> Self {
-//         Self {
-//             voxels: [Block::None; 32 * 32 * 32],
-//             changes: HashMap::new(),
-//             generated: false,
-//             pipeline: Pipeline::None,
-//         }
-//     }
-
-//     pub fn add_change(&mut self, wv: &IVec3, new_block: Block) -> Block {
-//         let voxel_v = wv_to_voxel_v(wv);
-//         let old_block = self.changes.insert(voxel_v, new_block).unwrap_or_else(|| {
-//             let idx = self.linearize(&voxel_v);
-//             godot_print!(
-//                 "[VoxelWorld2] (add_change) - wv: {wv} => voxel_v: {voxel_v} => idx: {idx}"
-//             );
-//             self.voxels[idx]
-//         });
-
-//         self.pipeline = Pipeline::NeedsFastMesh;
-
-//         old_block
-//     }
-
-//     fn linearize(&self, voxel_v: &IVec3) -> usize {
-//         Chunk32Shape::linearize(voxel_v.to_array()) as usize
-//     }
-
-//     pub fn merge_changes(self) -> Chunk34 {
-//         let mut voxels = [Block::None; 34 * 34 * 34];
-
-//         let size = 32;
-//         for z in 0..size {
-//             for y in 0..size {
-//                 for x in 0..size {
-//                     let voxel_v = IVec3::new(x, y, z);
-//                     let idx = self.linearize(&voxel_v);
-//                     let block = self
-//                         .changes
-//                         .get(&voxel_v)
-//                         .unwrap_or_else(|| &self.voxels[idx]);
-
-//                     // Offset by 1 to account for padding
-//                     let dst_x = (x + 1) as u32;
-//                     let dst_y = (y + 1) as u32;
-//                     let dst_z = (z + 1) as u32;
-//                     let dst_idx = Chunk34Shape::linearize([dst_x, dst_y, dst_z]) as usize;
-
-//                     voxels[dst_idx] = *block;
-//                 }
-//             }
-//         }
-
-//         Chunk34 { voxels }
-//     }
-
-//     pub fn shape(&self) -> Chunk32Shape {
-//         Chunk32Shape {}
-//     }
-// }
-
-pub type Chunk34ShapeI = ConstShape3i32<34, 34, 34>;
-pub type Chunk34ShapeU = ConstShape3u32<34, 34, 34>;
+pub type Chunk34ShapeI =
+    ConstShape3i32<CHUNK_SIZE_I_PADDED, CHUNK_SIZE_I_PADDED, CHUNK_SIZE_I_PADDED>;
+pub type Chunk34ShapeU =
+    ConstShape3u32<CHUNK_SIZE_U_PADDED, CHUNK_SIZE_U_PADDED, CHUNK_SIZE_U_PADDED>;
 
 #[derive(Clone)]
 pub struct Chunk34 {
-    voxels: [Block; 34 * 34 * 34],
+    voxels: [Block; Chunk34ShapeI::USIZE],
     changes: HashMap<IVec3, Block>,
     generated: bool,
-    pipeline: Pipeline,
+    pub pipeline: Pipeline,
+    solid_count: u32,
 }
 
 impl Chunk34 {
     fn empty() -> Self {
         Self {
-            voxels: [Block::None; 34 * 34 * 34],
+            voxels: [Block::None; Chunk34ShapeI::USIZE],
             changes: HashMap::new(),
             generated: false,
             pipeline: Pipeline::None,
+            solid_count: 0,
         }
     }
 
-    pub fn add_change(&mut self, wv: &IVec3, new_block: Block) -> Block {
+    pub fn add_change(&mut self, wv: &IVec3, new: Block) -> Block {
         let voxel_v = wv_to_lv(wv);
-        let old_block = self.changes.insert(voxel_v, new_block).unwrap_or_else(|| {
-            let idx = self.linearize_lv(&voxel_v);
-            godot_print!(
-                "[VoxelWorld2] (add_change) - wv: {wv} => voxel_v: {voxel_v} => idx: {idx}"
-            );
-            self.voxels[idx]
-        });
+        self.changes.insert(voxel_v, new);
+        let idx = self.linearize_lv(&voxel_v);
+        let old_block = self
+            .changes
+            .insert(voxel_v, new)
+            .unwrap_or_else(|| self.voxels[idx]);
 
-        self.pipeline = Pipeline::NeedsFastMesh;
+        self.pipeline = Pipeline::NeedsMesh;
 
         old_block
     }
 
+    pub fn add_block(&mut self, idx: usize, new: Block) {
+        self.voxels[idx] = new;
+        self.solid_count += new.solid();
+    }
+
+    pub fn replace_block(&mut self, idx: usize, new: Block) {
+        let old = std::mem::replace(&mut self.voxels[idx], new);
+        self.solid_count = self.solid_count - old.solid() + new.solid();
+    }
+
     pub fn merge_changes(&mut self) {
-        for (wv, block) in &self.changes {
-            let lv = wv_to_lv(&wv);
-            self.voxels[self.linearize_lv(&lv)] = *block;
+        let mutations = self
+            .changes
+            .iter()
+            .map(|(wv, b)| (self.linearize_lv(&wv_to_lv(&wv)), *b))
+            .collect::<Vec<(usize, Block)>>();
+
+        for (idx, block) in mutations {
+            self.replace_block(idx, block);
         }
     }
 
@@ -577,6 +525,14 @@ impl Chunk34 {
 
     pub fn shape_u(&self) -> Chunk34ShapeU {
         Chunk34ShapeU {}
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.solid_count == 0
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.solid_count == (CHUNK_SIZE_I * CHUNK_SIZE_I * CHUNK_SIZE_I) as u32
     }
 }
 
@@ -599,7 +555,7 @@ pub struct ChunkMesh {
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
     pub layers: Vec<f32>,
-    pub tangents: Vec<[f32; 4]>,
+    pub tangents: Vec<f32>,
 }
 
 impl ChunkMesh {
@@ -639,13 +595,16 @@ impl mikktspace::Geometry for ChunkMesh {
         _face: usize,
         vert: usize,
     ) {
-        let idx = self.vert_to_idx(vert);
+        let idx = self.vert_to_idx(vert) * 4;
         let w = if bi_tangent_preserves_orientation {
             1.0
         } else {
             -1.0
         };
-        self.tangents[idx] = [tangent[0], tangent[1], tangent[2], w];
+        self.tangents[idx] = tangent[0];
+        self.tangents[idx + 1] = tangent[1];
+        self.tangents[idx + 2] = tangent[2];
+        self.tangents[idx + 3] = w;
     }
 }
 
@@ -663,7 +622,7 @@ fn build_mesh_from_quads(
     let mut normals = Vec::with_capacity(num_vertices);
     let mut uvs = Vec::with_capacity(num_vertices);
     let mut layers = Vec::with_capacity(num_vertices);
-    let tangents = vec![[0.0; 4]; num_vertices];
+    let tangents = vec![0.0; num_vertices * 4];
 
     for (group, face) in buffer.groups.into_iter().zip(config.faces.into_iter()) {
         for quad in group.into_iter() {
